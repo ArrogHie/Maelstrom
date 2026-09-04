@@ -1,3 +1,106 @@
 ---
-BasedOnStyle: Google
+Language: Cpp
+BasedOnStyle: LLVM
+
+Standard: c++17
+
 IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+ColumnLimit: 0
+
+AllowShortIfStatementsOnASingleLine: true
+AllowShortLoopsOnASingleLine: true
+
+BreakBeforeBraces: Custom
+
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: Never
+  AfterEnum: false
+  AfterFunction: false
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: true
+  BeforeElse: true
+  BeforeLambdaBody: false
+  BeforeWhile: false
+  IndentBraces: false
+  SplitEmptyFunction: false
+  SplitEmptyRecord: false
+  SplitEmptyNamespace: false
+
+  SpaceBeforeParens: Never
+
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceBeforeAssignmentOperators: true
+
+SpaceAfterCStyleCast: false
+SpaceAfterLogicalNot: false
+
+# int *ptr
+PointerAlignment: Right
+
+ReferenceAlignment: Right
+
+AccessModifierOffset: -4
+
+SortIncludes: CaseSensitive
+
+IncludeBlocks: Regroup
+
+IncludeCategories:
+  # LLVM / C++ 标准库
+  - Regex: '^<.*>$'
+    Priority: 1
+    SortPriority: 1
+    CaseSensitive: false
+
+  # 本项目头文件
+  - Regex: '^".*"'
+    Priority: 2
+    SortPriority: 2
+    CaseSensitive: false
+
+
+NamespaceIndentation: None
+
+FixNamespaceComments: true
+
+CompactNamespaces: false
+
+IndentCaseLabels: false
+
+IndentCaseBlocks: false
+
+
+BreakConstructorInitializers: BeforeComma
+
+BreakInheritanceList: BeforeColon
+
+ConstructorInitializerAllOnOneLineOrOnePerLine: false
+
+PackConstructorInitializers: NextLine
+
+
+MaxEmptyLinesToKeep: 1
+
+KeepEmptyLinesAtTheStartOfBlocks: false
+
+KeepEmptyLinesAtEOF: false
+
+# 1. 连续赋值对齐（等号对齐）
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false # 是否跨空行对齐
+  AcrossComments: false   # 是否跨注释对齐
+
+# 2. 连续声明对齐（变量名对齐）
+AlignConsecutiveDeclarations:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+...

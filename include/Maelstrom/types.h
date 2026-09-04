@@ -1,0 +1,22 @@
+#pragma once
+#include <cstdint>
+
+namespace maelstrom {
+template <typename Tag, typename T>
+struct StrongType { // 强类型，防止类型传递混乱
+    T value;
+    constexpr explicit StrongType(T v = T{}) noexcept : value(v) {}
+    constexpr T    get() const noexcept { return value; }
+    constexpr bool operator==(const StrongType &other) const noexcept { return value == other.value; }
+    constexpr bool operator!=(const StrongType &other) const noexcept { return value != other.value; }
+};
+
+struct PriceTag {};
+struct QuantityTag {};
+struct OrderIdTag {};
+
+using Price    = StrongType<PriceTag, std::int64_t>;
+using Quantity = StrongType<QuantityTag, std::int64_t>;
+using OrderId  = StrongType<OrderIdTag, std::int64_t>;
+
+} // namespace maelstrom
