@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 #include "Maelstrom/order.h"
@@ -9,16 +10,35 @@ namespace maelstrom {
 
 class OrderBook {
 public:
-    void add(Order o);
-    bool cancel(OrderId id);
+    OrderBook();
+    ~OrderBook();
 
-    [[nodiscard]] std::optional<Order> best_bid() const; // 查询最高价
-    [[nodiscard]] std::optional<Order> best_ask() const; // 查询最低价
+    OrderBook(const OrderBook &)            = delete; // 禁止拷贝
+    OrderBook &operator=(const OrderBook &) = delete;
+    OrderBook(OrderBook &&) noexcept;
+    OrderBook &operator=(OrderBook &&) noexcept;
+
+    bool add(Order o);
+    bool cancel(OrderId id);
+    bool modify(OrderId id, Quantity newQuant);          // 改量
+    bool modify(OrderId id, Price p, Quantity newQuant); // 改价改量
+
+    [[nodiscard]] Quantity             quantity_at(Price p) const;
+    [[nodiscard]] std::optional<Order> best_bid() const; // 买方报价，最高价优先
+    [[nodiscard]] std::optional<Order> best_ask() const; // 卖方报价，最低价优先
+    [[nodiscard]] std::optional<Order> find(OrderId id) const;
     [[nodiscard]] std::size_t          size() const;
 
+    bool check_order(Order &o) const;
+
 private:
+    class Level;
+    class OrderNode;
+
     struct Impl; // 定义写在外部文件，保持接口稳定
-    Impl *impl = nullptr;
+    struct OrderIdHash;
+    std::unique_ptr<Impl>
+        impl;
 };
 
 } // namespace maelstrom

@@ -6,9 +6,17 @@ template <typename Tag, typename T>
 struct StrongType { // 强类型，防止类型传递混乱
     T value;
     constexpr explicit StrongType(T v = T{}) noexcept : value(v) {}
-    constexpr T    get() const noexcept { return value; }
+    [[nodiscard]] constexpr T get() const noexcept { return value; }
+
+    constexpr StrongType operator+(const StrongType &other) const noexcept { return StrongType{value + other.get()}; }
+    constexpr StrongType operator-(const StrongType &other) const noexcept { return StrongType{value - other.get()}; }
+
     constexpr bool operator==(const StrongType &other) const noexcept { return value == other.value; }
     constexpr bool operator!=(const StrongType &other) const noexcept { return value != other.value; }
+    constexpr bool operator<(const StrongType &other) const noexcept { return value < other.value; }
+    constexpr bool operator<=(const StrongType &other) const noexcept { return value <= other.value; }
+    constexpr bool operator>(const StrongType &other) const noexcept { return value > other.value; }
+    constexpr bool operator>=(const StrongType &other) const noexcept { return value >= other.value; }
 };
 
 struct PriceTag {};
