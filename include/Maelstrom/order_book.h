@@ -29,16 +29,15 @@ public:
     [[nodiscard]] std::optional<Order> find(OrderId id) const;
     [[nodiscard]] std::size_t          size() const;
 
-    bool check_order(Order &o) const;
-
 private:
     class Level;
     class OrderNode;
 
     struct Impl; // 定义写在外部文件，保持接口稳定
     struct OrderIdHash;
-    std::unique_ptr<Impl>
-        impl;
+    std::unique_ptr<Impl> impl;
+
+    bool check_order(const Order &o) const;
 };
 
 } // namespace maelstrom

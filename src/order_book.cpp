@@ -88,12 +88,14 @@ struct OrderBook::OrderIdHash {
 };
 
 struct OrderBook::Impl {
-    std::unordered_map<OrderId, std::unique_ptr<OrderNode>, OrderIdHash> orders;
     std::map<Price, Level, std::greater<>>                               orders_bid;
     std::map<Price, Level>                                               orders_ask;
+    std::unordered_map<OrderId, std::unique_ptr<OrderNode>, OrderIdHash> orders;
+
+    ~Impl() { orders.clear(); }
 };
 
-bool OrderBook::check_order(Order &o) const {
+bool OrderBook::check_order(const Order &o) const {
     if (o.orderId.get() <= 0) {
         return false;
     }
