@@ -10,11 +10,20 @@ enum class Side : std::int8_t {
     Buy
 };
 
+enum class OrderType : std::int8_t {
+    Limit,
+    Market,
+    Ioc,
+    Fok,
+    PostOnly
+};
+
 class Order {
 public:
-    Price    price;
-    OrderId  orderId;
-    Quantity quantity;
-    Side     side;
+    Price     price;
+    OrderId   orderId;
+    Quantity  quantity;
+    Side      side;
+    OrderType type = OrderType::Limit;
 };
 } // namespace maelstrom

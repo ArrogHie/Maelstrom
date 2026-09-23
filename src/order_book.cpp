@@ -251,4 +251,52 @@ Quantity OrderBook::quantity_at(Price p) const {
     return res;
 }
 
+std::optional<Fill> OrderBook::consume_best(Side side, Quantity qty) {
+    if (!impl) {
+        return std::nullopt;
+    }
+    std::optional<Order> opt_order;
+    if (side == Side::Buy) {
+        opt_order = this->best_bid();
+    }
+    else {
+        opt_order = this->best_ask();
+    }
+    if (!opt_order.has_value()) {
+        return std::nullopt;
+    }
+
+    Order order = opt_order.value();
+    if (qty >= order.quantity) {
+        this->cancel(order.orderId);
+        return Fill{0, order.price, order.quantity};
+    }
+    else {
+        this->modify(order.orderId, order.quantity - qty);
+        return Fill{0, order.price, qty};
+    }
+}
+
+std::optional<Quantity> OrderBook::matchalbe_quantity(Side side, std::optional<Price> limit) const {
+    if (!impl) {
+        return std::nullopt;
+    }
+    Quantity tot{0};
+    if (side == Side::Buy) {
+        auto &orders = impl->orders_ask;
+        for (auto &it : orders) {
+            if (limit.has_value() && it.second.price > limit.value()) break;
+            tot = tot + it.second.totQuant;
+        }
+    }
+    else {
+        auto &orders = impl->orders_bid;
+        for (auto &it : orders) {
+            if (limit.has_value() && it.second.price > limit.value()) break;
+            tot = tot + it.second.totQuant;
+        }
+    }
+    return tot;
+}
+
 } // namespace maelstrom

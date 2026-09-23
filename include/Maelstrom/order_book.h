@@ -8,6 +8,12 @@
 
 namespace maelstrom {
 
+struct Fill {
+    int      passive_id;
+    Price    price;
+    Quantity quantity;
+};
+
 class OrderBook {
 public:
     OrderBook();
@@ -23,11 +29,13 @@ public:
     bool modify(OrderId id, Quantity newQuant);          // 改量
     bool modify(OrderId id, Price p, Quantity newQuant); // 改价改量
 
-    [[nodiscard]] Quantity             quantity_at(Price p) const;
-    [[nodiscard]] std::optional<Order> best_bid() const; // 买方报价，最高价优先
-    [[nodiscard]] std::optional<Order> best_ask() const; // 卖方报价，最低价优先
-    [[nodiscard]] std::optional<Order> find(OrderId id) const;
-    [[nodiscard]] std::size_t          size() const;
+    [[nodiscard]] std::size_t             size() const;
+    [[nodiscard]] Quantity                quantity_at(Price p) const;
+    [[nodiscard]] std::optional<Order>    best_bid() const; // 买方报价，最高价优先
+    [[nodiscard]] std::optional<Order>    best_ask() const; // 卖方报价，最低价优先
+    [[nodiscard]] std::optional<Order>    find(OrderId id) const;
+    [[nodiscard]] std::optional<Fill>     consume_best(Side side, Quantity qty);
+    [[nodiscard]] std::optional<Quantity> matchalbe_quantity(Side side, std::optional<Price> limit) const;
 
 private:
     class Level;
