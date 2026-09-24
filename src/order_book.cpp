@@ -269,17 +269,17 @@ std::optional<Fill> OrderBook::consume_best(Side side, Quantity qty) {
     Order order = opt_order.value();
     if (qty >= order.quantity) {
         this->cancel(order.orderId);
-        return Fill{0, order.price, order.quantity};
+        return Fill{order.orderId, order.price, order.quantity};
     }
     else {
         this->modify(order.orderId, order.quantity - qty);
-        return Fill{0, order.price, qty};
+        return Fill{order.orderId, order.price, qty};
     }
 }
 
-std::optional<Quantity> OrderBook::matchalbe_quantity(Side side, std::optional<Price> limit) const {
+Quantity OrderBook::matchable_quantity(Side side, std::optional<Price> limit) const {
     if (!impl) {
-        return std::nullopt;
+        return Quantity{0};
     }
     Quantity tot{0};
     if (side == Side::Buy) {

@@ -38,8 +38,11 @@ function(maelstrom_target_warnings target)
 endfunction()
 
 # --- 主库
-add_library(maelstrom STATIC src/order_book.cpp
-    include/Maelstrom/order_book.h)
+add_library(maelstrom STATIC 
+    src/order_book.cpp
+    src/matching_engine.cpp
+    include/Maelstrom/order_book.h
+    include/Maelstrom/matching_engine.h)
 add_library(maelstrom::maelstrom ALIAS maelstrom)
 
 target_include_directories(maelstrom PUBLIC

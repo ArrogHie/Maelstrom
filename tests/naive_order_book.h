@@ -60,10 +60,11 @@ public:
         if (it == entries_.end()) return false;
         if (it->order.price == newPrice) { // 同价改量：保留时间优先级
             it->order.quantity = newQuantity;
-        } else {                            // 改价：撤单 + 重挂，发新 seq
-            it->order.price = newPrice;
+        }
+        else { // 改价：撤单 + 重挂，发新 seq
+            it->order.price    = newPrice;
             it->order.quantity = newQuantity;
-            it->seq = next_seq_++;
+            it->seq            = next_seq_++;
         }
         return true;
     }
@@ -89,12 +90,12 @@ public:
 
 private:
     struct Entry {
-        Order        order;
+        Order         order;
         std::uint64_t seq = 0;
     };
 
-    std::vector<Entry>  entries_;
-    std::uint64_t       next_seq_ = 1;
+    std::vector<Entry> entries_;
+    std::uint64_t      next_seq_ = 1;
 
     std::vector<Entry>::iterator find_it(OrderId id) {
         return std::find_if(entries_.begin(), entries_.end(),

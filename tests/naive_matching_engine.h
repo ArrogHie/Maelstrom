@@ -25,6 +25,8 @@
 #include "Maelstrom/matching_engine.h"
 #include "Maelstrom/order.h"
 
+using namespace matching_engine;
+
 namespace maelstrom {
 namespace test_support {
 
@@ -69,7 +71,7 @@ public:
             const int bi = best_index(opp, is_market ? std::nullopt : std::optional<Price>{o.price},
                                       o.side);
             if (bi < 0) break;
-            Entry  &passive = rest_[static_cast<std::size_t>(bi)];
+            Entry             &passive = rest_[static_cast<std::size_t>(bi)];
             const std::int64_t take =
                 std::min(remaining, passive.order.quantity.get());
             last_trades_.push_back(
@@ -79,7 +81,8 @@ public:
             ++trades;
             if (take >= passive.order.quantity.get()) {
                 rest_.erase(rest_.begin() + bi);
-            } else {
+            }
+            else {
                 passive.order.quantity = Quantity{passive.order.quantity.get() - take};
             }
         }
@@ -99,9 +102,11 @@ public:
         res.trade_count = trades;
         if (rest.get() > 0) {
             res.outcome = (filled > 0) ? OrderOutcome::PartiallyFilled : OrderOutcome::Rested;
-        } else if (filled == o.quantity.get()) {
-            res.outcome = OrderOutcome::Filled;   // 全额成交
-        } else {
+        }
+        else if (filled == o.quantity.get()) {
+            res.outcome = OrderOutcome::Filled; // 全额成交
+        }
+        else {
             res.outcome = OrderOutcome::Cancelled; // 有残余但被取消，未挂簿
         }
         return res;
@@ -172,9 +177,9 @@ private:
                 best = static_cast<int>(i);
                 continue;
             }
-            const Entry &b = rest_[static_cast<std::size_t>(best)];
-            const bool better = (side == Side::Sell) ? (e.order.price < b.order.price)
-                                                     : (e.order.price > b.order.price);
+            const Entry &b      = rest_[static_cast<std::size_t>(best)];
+            const bool   better = (side == Side::Sell) ? (e.order.price < b.order.price)
+                                                       : (e.order.price > b.order.price);
             if (better || (e.order.price == b.order.price && e.seq < b.seq)) {
                 best = static_cast<int>(i);
             }

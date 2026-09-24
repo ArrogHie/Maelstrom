@@ -10,9 +10,8 @@
 //                              比对 SubmitResult / 成交序列 / 簿状态。
 //
 // 语义契约见 docs/W3_MATCHING_GUIDE.md 的“判据”一节，两者必须逐字一致。
-#include <gtest/gtest.h>
-
 #include <cstdint>
+#include <gtest/gtest.h>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -24,6 +23,7 @@
 #include "Maelstrom/order_book.h"
 #include "naive_matching_engine.h"
 
+using namespace matching_engine;
 using namespace maelstrom;
 using maelstrom::test_support::NaiveMatchingEngine;
 
@@ -315,7 +315,7 @@ TEST(MatchingW3, MarketBuySweepsThenCancelsRemainder) {
 
 TEST(MatchingW3, MarketOnEmptyBookCancels) {
     MatchingEngine eng;
-    SubmitResult r = eng.submit(mk(1, 0, 5, Side::Buy, OrderType::Market));
+    SubmitResult   r = eng.submit(mk(1, 0, 5, Side::Buy, OrderType::Market));
     expect_result(r, OrderOutcome::Cancelled, Quantity{0}, Quantity{0}, 0);
     EXPECT_TRUE(r.accepted());
     EXPECT_EQ(eng.book().size(), 0u);
@@ -403,7 +403,7 @@ TEST(MatchingW3, FokNotFillableRejectedWithoutSideEffects) {
     SubmitResult r = eng.submit(mk(9, 101, 8, Side::Buy, OrderType::Fok));
     expect_result(r, OrderOutcome::Rejected, Quantity{0}, Quantity{0}, 0,
                   RejectReason::FokNotFillable);
-    EXPECT_TRUE(log.trades.empty()); // 无成交
+    EXPECT_TRUE(log.trades.empty());  // 无成交
     EXPECT_EQ(eng.book().size(), 2u); // 簿未被改动
     expect_order(eng.book().best_ask(), 1, 100, 3, Side::Sell);
 }
@@ -431,7 +431,7 @@ TEST(MatchingW3, FokSellSide) {
 TEST(MatchingW3, FokIsPricedType) {
     // FOK 属于“限价类”：必须给出正价格（市价 FOK 由扩展模块的 Market+TimeInForce 组合表达）。
     MatchingEngine eng;
-    SubmitResult r = eng.submit(mk(1, 0, 5, Side::Buy, OrderType::Fok));
+    SubmitResult   r = eng.submit(mk(1, 0, 5, Side::Buy, OrderType::Fok));
     expect_result(r, OrderOutcome::Rejected, Quantity{0}, Quantity{0}, 0,
                   RejectReason::InvalidPrice);
 }
@@ -442,7 +442,7 @@ TEST(MatchingW3, FokIsPricedType) {
 
 TEST(MatchingW3, PostOnlyRestsWhenNoCross) {
     MatchingEngine eng;
-    SubmitResult r = eng.submit(mk(1, 100, 5, Side::Buy, OrderType::PostOnly));
+    SubmitResult   r = eng.submit(mk(1, 100, 5, Side::Buy, OrderType::PostOnly));
     expect_result(r, OrderOutcome::Rested, Quantity{0}, Quantity{5}, 0);
     expect_order(eng.book().best_bid(), 1, 100, 5, Side::Buy);
 }
@@ -538,9 +538,7 @@ TEST(MatchingW3, QuantityAccountingPerType) {
         std::int64_t qty;
         std::int64_t price;
     };
-    const Case cases[] = {{OrderType::Limit, 50, 100}, {OrderType::Ioc, 50, 100},
-                          {OrderType::Fok, 20, 100},   {OrderType::Market, 7, 100},
-                          {OrderType::PostOnly, 5, 99}};
+    const Case cases[] = {{OrderType::Limit, 50, 100}, {OrderType::Ioc, 50, 100}, {OrderType::Fok, 20, 100}, {OrderType::Market, 7, 100}, {OrderType::PostOnly, 5, 99}};
     for (const Case &c : cases) {
         MatchingEngine eng;
         ASSERT_TRUE(eng.submit(mk(1, 100, book_qty, Side::Sell)).accepted());
@@ -604,7 +602,7 @@ TEST(MatchingW3, EngineIsMoveOnly) {
     MatchingEngine a;
     ASSERT_TRUE(a.submit(mk(1, 100, 5, Side::Sell)).accepted());
     MatchingEngine b(std::move(a));
-    SubmitResult r = b.submit(mk(2, 100, 5, Side::Buy));
+    SubmitResult   r = b.submit(mk(2, 100, 5, Side::Buy));
     expect_result(r, OrderOutcome::Filled, Quantity{5}, Quantity{0}, 1);
 }
 
@@ -616,7 +614,7 @@ TEST(MatchingW3, LifetimeStressManyAllocsAndSweeps) {
     std::mt19937 rng(20260915u);
     for (int round = 0; round < 40; ++round) {
         MatchingEngine eng;
-        std::int64_t    id = 1;
+        std::int64_t   id = 1;
         for (int i = 0; i < 150; ++i) {
             const std::int64_t price = 95 + static_cast<std::int64_t>(rng() % 12);
             const std::int64_t qty   = 1 + static_cast<std::int64_t>(rng() % 20);
@@ -624,9 +622,11 @@ TEST(MatchingW3, LifetimeStressManyAllocsAndSweeps) {
             OrderType          type  = OrderType::Limit;
             if (rng() % 3 == 0) {
                 type = OrderType::Limit;
-            } else if (rng() % 4 == 0) {
+            }
+            else if (rng() % 4 == 0) {
                 type = OrderType::Ioc;
-            } else {
+            }
+            else {
                 type = OrderType::Market;
             }
             [[maybe_unused]] const SubmitResult r = eng.submit(mk(id++, price, qty, side, type));
@@ -682,8 +682,8 @@ TEST(MatchingW3, LifetimeRejectedLoopHasNoResidue) {
     TradeLog       log;
     eng.set_trade_handler([&](const Trade &t) { log(t); });
     for (int i = 0; i < 1000; ++i) {
-        EXPECT_FALSE(eng.submit(mk(i + 1, 0, 10, Side::Buy)).accepted());        // 非法价
-        EXPECT_FALSE(eng.submit(mk(i + 1, 100, 0, Side::Buy)).accepted());       // 非法量
+        EXPECT_FALSE(eng.submit(mk(i + 1, 0, 10, Side::Buy)).accepted());  // 非法价
+        EXPECT_FALSE(eng.submit(mk(i + 1, 100, 0, Side::Buy)).accepted()); // 非法量
         EXPECT_FALSE(eng.submit(mk(i + 1, 100, 5, Side::Buy, OrderType::Fok)).accepted());
     }
     EXPECT_EQ(eng.book().size(), 0u);
@@ -762,8 +762,8 @@ TEST(BookPrimitivesW3, MatchableQuantityWholeSide) {
     EXPECT_EQ(book.matchable_quantity(Side::Sell, Price{100}).get(), 5);  // <= 100
     EXPECT_EQ(book.matchable_quantity(Side::Sell, Price{101}).get(), 12); // <= 101
     EXPECT_EQ(book.matchable_quantity(Side::Sell, Price{99}).get(), 0);   // 无可成交
-    EXPECT_EQ(book.matchable_quantity(Side::Buy, Price{90}).get(), 9);  // >= 90
-    EXPECT_EQ(book.matchable_quantity(Side::Buy, Price{100}).get(), 0); // 买价 90 < 100，不交叉
+    EXPECT_EQ(book.matchable_quantity(Side::Buy, Price{90}).get(), 9);    // >= 90
+    EXPECT_EQ(book.matchable_quantity(Side::Buy, Price{100}).get(), 0);   // 买价 90 < 100，不交叉
 }
 
 TEST(BookPrimitivesW3, MatchableQuantityEmptyBook) {
@@ -777,8 +777,8 @@ TEST(BookPrimitivesW3, MatchableQuantityEmptyBook) {
 // ===========================================================================
 namespace {
 
-constexpr int                   kNumIds  = 12;
-constexpr std::int64_t          kIdBase  = 7000;
+constexpr int                   kNumIds = 12;
+constexpr std::int64_t          kIdBase = 7000;
 const std::vector<std::int64_t> kPrices{99, 100, 101, 102, 103, 104};
 
 OrderId OID_OF(int i) { return OID(kIdBase + i); }
@@ -803,9 +803,9 @@ TEST_P(MatchingDifferential, RandomSubmitSequence) {
     const int    seed = GetParam();
     std::mt19937 rng(static_cast<std::uint32_t>(seed));
 
-    MatchingEngine    fast;
+    MatchingEngine      fast;
     NaiveMatchingEngine slow;
-    std::vector<Trade> captured;
+    std::vector<Trade>  captured;
     fast.set_trade_handler([&](const Trade &t) { captured.push_back(t); });
 
     std::string first_diff;
@@ -848,16 +848,16 @@ TEST_P(MatchingDifferential, RandomSubmitSequence) {
 
     constexpr int kOps = 400;
     for (int step = 0; step < kOps; ++step) {
-        const int  i    = static_cast<int>(rng() % kNumIds);
-        const int  roll = static_cast<int>(rng() % 100);
+        const int i    = static_cast<int>(rng() % kNumIds);
+        const int roll = static_cast<int>(rng() % 100);
 
         if (roll < 72) { // submit
-            std::int64_t       price = kPrices[rng() % kPrices.size()];
-            std::int64_t       qty   = 1 + static_cast<std::int64_t>(rng() % 9);
-            const Side         side  = (rng() % 2 == 0) ? Side::Buy : Side::Sell;
-            const OrderType    type  = types[rng() % 5];
+            std::int64_t    price = kPrices[rng() % kPrices.size()];
+            std::int64_t    qty   = 1 + static_cast<std::int64_t>(rng() % 9);
+            const Side      side  = (rng() % 2 == 0) ? Side::Buy : Side::Sell;
+            const OrderType type  = types[rng() % 5];
             if (rng() % 17 == 0) price = -static_cast<std::int64_t>(rng() % 3); // 偶尔非法价
-            if (rng() % 19 == 0) qty = 0;                                        // 偶尔非法量
+            if (rng() % 19 == 0) qty = 0;                                       // 偶尔非法量
             const Order o{Price{price}, OID_OF(i), Quantity{qty}, side, type};
 
             captured.clear();
@@ -892,8 +892,8 @@ TEST_P(MatchingDifferential, RandomSubmitSequence) {
         else { // cancel（含未知 id）
             const std::int64_t id = (rng() % 5 == 0) ? (90000 + static_cast<std::int64_t>(rng() % 5))
                                                      : kIdBase + i;
-            const bool a = fast.cancel(OID(id));
-            const bool b = slow.cancel(OID(id));
+            const bool         a  = fast.cancel(OID(id));
+            const bool         b  = slow.cancel(OID(id));
             if (a != b) {
                 std::ostringstream os;
                 os << "seed=" << seed << " step=" << step << " cancel(" << id << ") 返回值不一致";

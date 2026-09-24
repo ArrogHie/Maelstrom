@@ -9,7 +9,7 @@
 namespace maelstrom {
 
 struct Fill {
-    int      passive_id;
+    OrderId  passive_id;
     Price    price;
     Quantity quantity;
 };
@@ -29,13 +29,13 @@ public:
     bool modify(OrderId id, Quantity newQuant);          // 改量
     bool modify(OrderId id, Price p, Quantity newQuant); // 改价改量
 
-    [[nodiscard]] std::size_t             size() const;
-    [[nodiscard]] Quantity                quantity_at(Price p) const;
-    [[nodiscard]] std::optional<Order>    best_bid() const; // 买方报价，最高价优先
-    [[nodiscard]] std::optional<Order>    best_ask() const; // 卖方报价，最低价优先
-    [[nodiscard]] std::optional<Order>    find(OrderId id) const;
-    [[nodiscard]] std::optional<Fill>     consume_best(Side side, Quantity qty);
-    [[nodiscard]] std::optional<Quantity> matchalbe_quantity(Side side, std::optional<Price> limit) const;
+    [[nodiscard]] std::size_t          size() const;
+    [[nodiscard]] Quantity             quantity_at(Price p) const;
+    [[nodiscard]] std::optional<Order> best_bid() const; // 买方报价，最高价优先
+    [[nodiscard]] std::optional<Order> best_ask() const; // 卖方报价，最低价优先
+    [[nodiscard]] std::optional<Order> find(OrderId id) const;
+    [[nodiscard]] std::optional<Fill>  consume_best(Side side, Quantity qty);                           // 进行成交
+    [[nodiscard]] Quantity             matchable_quantity(Side side, std::optional<Price> limit) const; // 可成交量
 
 private:
     class Level;
