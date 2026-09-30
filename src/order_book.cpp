@@ -283,14 +283,14 @@ Quantity OrderBook::matchable_quantity(Side side, std::optional<Price> limit) co
     }
     Quantity tot{0};
     if (side == Side::Buy) {
-        auto &orders = impl->orders_ask;
+        auto &orders = impl->orders_bid;
         for (auto &it : orders) {
-            if (limit.has_value() && it.second.price > limit.value()) break;
+            if (limit.has_value() && it.second.price < limit.value()) break;
             tot = tot + it.second.totQuant;
         }
     }
     else {
-        auto &orders = impl->orders_bid;
+        auto &orders = impl->orders_ask;
         for (auto &it : orders) {
             if (limit.has_value() && it.second.price > limit.value()) break;
             tot = tot + it.second.totQuant;

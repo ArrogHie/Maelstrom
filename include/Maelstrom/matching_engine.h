@@ -35,7 +35,7 @@ struct Trade {
 
 struct SubmitResult {
     OrderOutcome outcome;
-    RejectReason reason;
+    RejectReason reason = RejectReason::None;
     Quantity     filled{0};
     Quantity     resting{0};
     unsigned int trade_count{0};
