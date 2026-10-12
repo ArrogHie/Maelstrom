@@ -25,5 +25,6 @@ public:
     Quantity  quantity;
     Side      side;
     OrderType type = OrderType::Limit;
+    AccountId account{0};
 };
 } // namespace maelstrom

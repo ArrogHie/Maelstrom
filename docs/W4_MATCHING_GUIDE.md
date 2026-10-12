@@ -1,313 +1,568 @@
-# W4 手写任务单 —— 事件总线、自成交防护与集成验收
+# W4 手写任务单 —— 让引擎学会广播（EventBus）与自律（自成交防护）
 
-> 这是一份**练习册**，不是参考手册。W3 你交付了一个会成交的市场：
-> 五种订单类型、price-time 撮合、`SubmitResult` 回执。但它有两个明显的"盲区"：
-> **成交的事只有一个人知道**（`set_trade_handler` 是单订阅，风控/行情/日志想同时听就没了办法），
-> 以及**它会自己吃自己**（同一账户的两笔单在簿上照样成交——真实交易所把这当成事故）。
-> W4 要给它装上"麦克风与风控"：**EventBus** 把每笔成交/挂单/撤单/拒绝广播给任意多订阅者，
-> **自成交防护（STP）** 让引擎学会在执行接触点上拦下自己的单，最后用**随机差分**把三者一起锁死。
+> 这是一份**练习册**，不是参考手册。W3 你交付的引擎会成交、会回执，但它有两个"单点故障"：
+> ① 成交只告诉一个人（`set_trade_handler` 是单槽位），撤单和拒单干脆没有出口；
+> ② 它会自己吃自己（同一账户的双边挂单照常成交）。
+> W4 给引擎装上"广播器"与"自律机制"，并用与 W3 同级的四层验收把它们锁死。
 >
-> 每个任务仍按固定四段组织：
->
-> **① 问题** → 你此刻面对的具体困难或现象（先想清楚"为什么要有这一步"）
-> **② 提示** → 怎么动手的线索（不是完整答案，卡住再往下读）
-> **③ 理想效果** → 完成后应该能看到什么（命令输出 / 测试颜色）
-> **④ 答案** → 放在文末附录，编号对应。写不出或写完对照，**别复制粘贴，手打一遍**
+> 与 W3 相同的四段任务格式和外置裁判规则不变。但这份文档的**读法**有一处不同：
+> 类型与字段不再以清单形式先给你（那样你只会背名字），而是每一类东西都从
+> "现在到底疼在哪"推导出来；推导完才给出正式契约。测试红了的时候，
+> 先到文末 **「契约速查」** 对照定位（那里是速查表，不是学习材料），再回 §1/§2 看它为什么长这样。
 >
 > 规则重申：所有实现代码由你手写进 `include/` 和 `src/`。`tests/` 里已备好**裁判测试**
-> （AI 隔离编写，只做验收、不进你的实现目录）：W4 共 76 个用例，分四块——
-> 语义单测 25 个 + 生命周期压力 3 个（`MatchingW4.*`）、事件总线 8 个（`EventBusW4.*`）、
-> 40 组随机差分对拍 `Seeds/MatchingDifferentialW4.*`（你的引擎 vs 带账户和 STP 的慢速参考引擎，
+> （AI 隔离编写，只做验收、不进你的实现目录）：W4 共 76 个用例——
+> 语义单测 25 + 生命周期压力 3（`MatchingW4.*`）、总线单测 8（`EventBusW4.*`）、
+> 40 组随机差分 `Seeds/MatchingDifferentialW4.*`（你的引擎 vs 带账户与 STP 的慢速参考引擎，
 > 逐步比对 SubmitResult / **完整事件流** / 簿状态）。
-> 语义契约见下方"判据"，你的代码和它必须逐字一致。
-> **回归铁律：W1–W3 的 151 个测试必须保持全绿**——你正在给已上线的数据结构加字段、
-> 给已有的撮合循环加逻辑，旧测试就是你的安全网。
+>
+> **回归铁律：W1–W3 的 151 个测试必须保持全绿。** 本周你在给一台正在运转的引擎追加字段和
+> 逻辑，旧测试是你唯一的安全网——"新功能绿了但旧的红了"不算任何进展。
+>
+> 前置状态：W3 已完成、151 全绿。语言标准 C++17。
 
 ---
 
-## 0. 先认识问题：W4 到底在解决什么
+## 0. W3 交付了什么，两个新需求从哪里来
 
-W3 交付后，引擎的核心循环是对的，但有三个真问题：
+### 0.1 现状盘点
 
-| # | 问题 | 后果 |
-|---|---|---|
-| 1 | **结果只有一个人知道**：`set_trade_handler` 是单槽位，换 handler 旧的就没 | 风控、行情分发、日志、回测统计都想订阅成交——单回调装不下，"事件驱动架构"无从谈起 |
-| 2 | **引擎会自己吃自己**：同一账户挂卖 100 买 100 照样成交 | 真实市场里这是操纵价格/误操作的源头，交易所都有 Self-Match Prevention（STP）；JD 里"自成交防护"是高频词 |
-| 3 | **功能叠加后正确性悬空**：账户、策略、事件都是新状态，组合爆炸 | 手写用例永远枚举不完"FOK 撞上自己的挂单""IOC 连撤两笔自己的单"这类交叉场景——只有随机差分能兜底 |
-
-W4 的四步解法：
-
-```
-①  给 Order 加 account 字段           → "谁的单"有了落脚点（0 = 未设置，永不触发 STP）
-②  定义 Event / EventBus             → 事件有形状，总线有多订阅/退订/顺序保证
-③  引擎加 STP + 事件发布点            → 执行接触点拦截 + submit/cancel 全程广播
-④  裁判测试（隔离）                  → 语义 + 总线 + 生命周期/UB + 随机差分，四层验收
-```
-
-一句面试话术：**W3 让引擎"做对的事"，W4 让引擎"把自己做的事如实、有序地告诉所有关心的人，
-并且不给自己开后门"。**
-
----
-
-## 1. 判据：测试裁判的规则（先通读，别跳）
-
-下面每一条都被 `tests/test_matching_engine_w4.cpp` 和 `tests/naive_matching_engine_w4.h` 强制。
-任何一条没满足，测试就红；红的时候回来对照这里。
-
-### 1.1 类型与字段
-
-- `types.h` 新增强类型 `AccountId`（与 `OrderId` 同款：`AccountId{int64}`、`get()`、`==`）。
-- `Order` 新增 `AccountId account{0};`，**必须加在 `type` 之后且带默认值**——
-  W1/W2 的四段、W3 的五段聚合初始化必须原样编译通过。**`account == 0` 表示"未设置账户"，
-  永不触发自成交防护**（这也是 W3 差分测试不需要改一个字就能继续跑的原因）。
-- `SelfMatchPolicy : std::uint8_t { CancelNewest, CancelOldest }`，引擎默认 `CancelNewest`。
-- `EventKind : std::uint8_t { Trade, OrderRested, OrderCanceled, OrderRejected }`。
-- `using SubscriptionId = std::uint64_t;`，订阅号**从 1 开始、单调递增、不复用**。
-- `Event` 结构（字段顺序固定，测试逐字段比对）：
-
-| 字段 | 类型 | Trade | OrderRested | OrderCanceled | OrderRejected |
-|---|---|---|---|---|---|
-| `kind` | `EventKind` | Trade | OrderRested | OrderCanceled | OrderRejected |
-| `order_id` | `OrderId` | 主动单 id | 该单 id | 被撤/取消的单 id | 该单 id |
-| `account` | `AccountId` | 主动方账户 | 该单账户 | 被撤单账户 | 该单账户 |
-| `side` | `Side` | 主动方向 | 该单方向 | 被撤单方向 | 该单方向 |
-| `counterparty_id` | `OrderId` | 被动单 id | `{0}` | `{0}` | `{0}` |
-| `price` | `Price` | 成交价（被动价） | 挂单价 | `{0}` | `{0}` |
-| `quantity` | `Quantity` | 成交量 | 挂簿量 | 被撤/取消的量 | `{0}` |
-| `reason` | `RejectReason` | None | None | None | 拒绝原因 |
-
-  与 `kind` 无关的字段保持默认值（`{0}` / `None`）。`Event` 是带默认成员初始化的聚合，
-  **没有默认值的字段就是 bug**——W3 差分测试抓过一次"未初始化的 reason"（教训还热着）。
-
-### 1.2 自成交防护（STP）
-
-- **触发条件**：撮合循环中，主动单即将吃掉对手队头时（**执行接触点**，只看队头这一笔），
-  `aggressor.account != 0 && passive.account == aggressor.account` 即触发。
-  账户不同、或任一方为 0 → 不触发，正常成交。**负数账户是非 0**，同样触发。
-- **只在接触点判定，不预扫全簿**：自己 deeper 价位的挂单在没被"即将吃到"之前不拦截。
-- **`CancelNewest`**：主动单**余量全部取消**（此前已成交的部分保留）；
-  该队头挂单**纹丝不动**；余量不挂簿。outcome = `Cancelled`（resting=0）；
-  发一个 `OrderCanceled{主动单 id, quantity=取消的余量}`。
-- **`CancelOldest`**：把队头挂单**整单撤销**（等价一次撤单：摘链/删空档/释放，
-  发 `OrderCanceled{被撤单 id, quantity=其全部剩余量}`），撮合**继续**——
-  同价下一笔如果又是自己的，再次触发，依次后撤。
-- **策略只影响其后的 submit**：`set_self_match_policy` 随时可切。
-- **预检不看账户（刻意取舍）**：POST-ONLY 预检遇到**自己账户**的最优价照样拒
-  （`PostOnlyWouldCross`）；FOK 预检的 `matchable_quantity` 把自己挂单也计入可用量。
-  于是可能出现"FOK 通过预检、执行时被 STP 砍掉余量"→ outcome = `Cancelled` 且 filled < quantity。
-  这是定义好的行为，差分测试覆盖。为什么这么设计？预检回答的是"市场有没有这么多流动性"，
-  STP 回答的是"这些流动性里哪些不能碰"——把它们耦合会让预检变成 O(own orders) 的扫描，
-  而真实交易所也普遍是执行时点判定。
-
-### 1.3 事件发布点
-
-- 每次 `submit` 的事件序列：
-  1. `n` 个 `Trade` 事件（n = 成交笔数，按撮合顺序）；
-  2. **恰好一个终态事件**：
-     - 余量挂簿（Limit/PostOnly，含部分成交后）→ `OrderRested{quantity=挂簿量, price=挂单价}`；
-     - 余量被取消（Market/IOC 余量、STP-CancelNewest 砍掉的余量）→ `OrderCanceled{quantity=余量}`；
-     - **全额成交 → 不发终态事件**（事件流 = 市场可观察事实：簿变了、单被拒了才有事可报；
-       Filled 除了成交没有任何其他事实）。
-- 被拒的 `submit` → **恰好一个** `OrderRejected{reason=...}`，零其他事件。
-- `cancel(id)` 成功 → 恰好一个 `OrderCanceled{quantity=该单全部剩余量}`；失败（不在簿）→ 零事件。
-- STP-CancelOldest 每撤一笔自己的挂单发一个 `OrderCanceled`（可能连续多个）。
-- **W3 的 `set_trade_handler` 通道与事件总线相互独立**：两者都会收到成交，
-  互不影响（handler 只收 Trade，不收终态事件）。
-- **分发时机与顺序**：同步；事件在 `submit`/`cancel` 返回前全部发完；
-  多订阅者按**订阅注册顺序**逐一回调。
-- 引擎未连接任何订阅者时照常撮合（发布到空总线是 no-op）。
-
-### 1.4 EventBus API
+W3 结束时，`MatchingEngine` 对外恰好三件能力，先把它们摆出来（后面所有推导都从这三件能力的边界出发）：
 
 ```cpp
-class EventBus {
-public:
-    using Handler = std::function<void(const Event &)>;
-    SubscriptionId subscribe(Handler handler);   // 从 1 递增，不复用
-    bool unsubscribe(SubscriptionId id);         // 不存在返回 false（含二次退订）
-    void publish(const Event &event);            // 按注册顺序同步分发
-    std::size_t subscriber_count() const;
+SubmitResult submit(Order o);         // 五种订单类型 + 连续撮合，回答"我这一单怎么了"
+void set_trade_handler(TradeHandler); // 单个成交回调槽位
+bool cancel(OrderId id);              // 撤单，只回一个 bool
+```
+
+### 0.2 需求 A：引擎里发生的事，要能同时告诉很多人
+
+场景具体到步骤：你把引擎接进一个交易台。
+
+- **第一天**：日志模块要成交明细 → `set_trade_handler` 挂上，能用。
+- **第二天**：风控模块也要成交，还要监控挂单变化和撤单 → 三个麻烦同时冒出来：
+
+| 麻烦 | 现状 | 后果 |
+|---|---|---|
+| 槽位只有一个 | `set_trade_handler` 是**替换**语义（W3 的 `HandlerCanBeReplaced` 测的就是"换人后旧回调不再收到"） | 风控挂上，日志当场失聪 |
+| 撤单没有出口 | `cancel(id)` 只回 `bool`，不产生任何回调 | 风控无法维护"当前还有哪些单在外面" |
+| 拒单没有出口 | 被拒的 `submit` 不发任何回调（W3 测试专门断言拒单时回调为空） | 风控看不见被拒流量的原因分布——而那恰是它最想看的 |
+
+三个麻烦指向同一个能力缺口：引擎内部"发生了什么"需要一个**结构化的、可多播的、带身份的**出口。
+
+### 0.3 需求 B：引擎不许自己吃自己
+
+第二个场景：做市策略在同一账户（比如 account=7）同时挂了卖 5@100 和买 10@100。W3 的引擎非常忠实地让它们成交了——5 手被"自己人"吃掉。这在真实市场里的性质：
+
+- **成交量/成交额虚增**：同一主体的买卖对倒不改变任何净头寸，却让成交统计、返佣计算、行情 tape 全部失真——这正是"洗售"（wash trading）的定义；
+- **风控口径污染**：持仓、盈亏、敞口全被无意义成交干扰；
+- **合规要求**：真实交易所普遍提供自成交防护（Self-Match Prevention, STP）机制，很多场景下同一账户自成交是被明文禁止的，JD 里"自成交防护"也是高频词。
+
+所以第二件事：引擎在执行层面拦下"自己撞自己"，并且把拦截过程变成**可观测事件**（谁被取消了、取消了多少）——需求 A 和 B 天然咬合在一起。
+
+### 0.4 本周验收标准（先定验收，再谈实现）
+
+1. **多播可用**：任意多个观察者可以订阅/退订引擎事件；能收到成交、挂簿、取消、拒绝四类事实；字段完整、顺序确定、同步送达。
+2. **STP 生效**：同一账户（非 0）的主动单不会与自己的挂单成交；两种策略（CancelNewest / CancelOldest）逐条符合契约；`account == 0` 的订单行为与 W3 **逐字节一致**。
+3. **回归与门禁**：W1–W3 的 151 个测试不改一行仍全绿；W4 新增 76 个全绿；ASan/UBSan/LSan 下 227 个全绿。
+
+范围边界（明确不做）：Decrement / RejectIncoming 等更多 STP 策略、异步分发与多线程（W5）、事件持久化/回放、`std::variant` 版事件。这些都留到扩展模块，理由在 §2.3 和 §1.3 里各自说明。
+
+---
+
+## 1. 需求 A 的推导：从单槽位到事件总线
+
+### 1.1 自然的基线方案，与它的三处硬伤
+
+面对 0.2 的麻烦，最顺手的改良是把"一个槽位"换成"一组回调"。这是**合理**的第一反应，不要跳过它直接看答案：
+
+```cpp
+// 基线 B1：把槽位扩成数组
+std::vector<std::function<void(const Trade &)>> handlers_;
+void add_trade_handler(std::function<void(const Trade &)> h) { handlers_.push_back(std::move(h)); }
+// submit 循环里：for (auto &h : handlers_) h(t);
+```
+
+B1 解决了"多个消费者"的一半问题，但马上碰到三处硬伤：
+
+1. **没有身份，退订只能靠下标**。风控模块想停掉自己的订阅，你只能给它一个 `size_t index`。而 `handlers_.erase(begin()+1)` 之后，原来拿 index=2 的订阅者变成了 index=1——它下次退订会删掉别人。这是一种"句柄随容器搬运而错位"的经典 bug，W2 撤单时你已经在订单簿里见过它的反面（订单簿用 `orderId` 而不是数组下标做句柄，正是为了这个）。
+2. **消息太窄**。仍然是成交专用类型。挂簿、撤单、拒绝都没有出口（0.2 的后两行麻烦原封不动）。
+3. **事实种类会继续增长**。今天四种，明天可能要加"订单被改价"。如果每加一种事实就在引擎上加一对 `add_xxx_handler/remove_xxx_handler`，API 会被事实清单钉死。
+
+另一种合理的基线是"每种事实一条独立通道"：`on_trade / on_rest / on_cancel / on_reject` 四个回调数组。它类型更漂亮，但**跨通道的顺序丢了**——一个想按真实时间顺序回放全部事件的消费者（回测/日志/行情镜像）必须自己把四条流合并成一条，还要再建一套全局时序。既然"顺序"本身是我们要保证的东西，那就应该由引擎在**一条流**上保证。
+
+于是能力缺口收敛成三条：
+
+| # | 缺口 | 对应设计决定 |
+|---|---|---|
+| A1 | 一条**覆盖全部事实**的消息类型 | `Event` + `EventKind`（§1.2、§1.3） |
+| A2 | 订阅要有**稳定身份**，能精确退订 | `SubscriptionId` + `subscribe/unsubscribe`（§1.4） |
+| A3 | **确定的投递顺序与时机** | 注册顺序 + 同步分发（§1.4） |
+
+### 1.2 消息的形状从哪里来：枚举"订单身上能发生的事实"
+
+不要凭空设计消息。"引擎里能发生什么"这件事是可数的——走一遍 `submit` / `cancel` 的全部出口，问每个出口**对外部世界做了什么可观察的变化**：
+
+| 出口 | 外部世界可观察到的变化 |
+|---|---|
+| 吃掉对手盘队头 | 市场发生了成交 |
+| 余量挂入簿中 | 簿上多了一笔挂单 |
+| 余量被丢弃（Market/IOC 的残余） | 一笔已被受理的单死了，且簿上什么都没有 |
+| 整单被拒 | 没有市场变化，但"拒绝"本身是一个可观察事实 |
+| `cancel(id)` 成功 | 簿上少了一笔挂单 |
+
+（最后两个是"簿没变但状态事实新发生"，前三个是"簿变了"。）
+
+这五行就是消息种类的全部来源。把措辞统一到"事实"上：
+
+```cpp
+enum class EventKind : std::uint8_t {
+    Trade,         // 一笔成交
+    OrderRested,   // 余量挂入簿（含部分成交后的余量）
+    OrderCanceled, // 簿上订单被撤 / 余量被取消
+    OrderRejected, // 订单被拒
 };
 ```
 
-- 引擎持有 `EventBus` 成员，对外转发：`subscribe(handler)` / `unsubscribe(id)` /
-  `set_self_match_policy(policy)`。
-- **分发期间不允许 subscribe/unsubscribe**（重入改订阅集合是未定义行为，测试不制造这个场景；
-  W5 上并发时这里要升级成正式契约）。
+**四个值不是"定的"，是数出来的。** 数法：任何一笔订单的任何结局，都落在"成交了一段 / 挂进了簿 / 被取消了 / 被拒绝了"这四类可观察事实里。以后要加事实（比如"订单被改价"），往这个枚举里加值，总线与订阅端结构不用动——这正是 B1 硬伤 3 想要的性质。
 
-### 1.5 校验（不变，重申）
+**关键取舍：全额成交为什么没有"完成"事件？** 这不是漏了，是两条输出通道的职责划分：
 
-W3 的校验顺序原样保留：`quantity <= 0 → InvalidQuantity`；
-`orderId 已在簿 → DuplicateOrderId`；非市价 `price <= 0 → InvalidPrice`；
-POST-ONLY 交叉 → `PostOnlyWouldCross`；FOK 不可全额 → `FokNotFillable`。
-**`account` 不参与校验**（任何 int64 都是合法账户）。每个拒绝路径发一个 `OrderRejected`。
+- **`SubmitResult`** 回答"**你这一单**怎么了"——对调用者负责，一对一；
+- **`Event`** 回答"**市场**发生了什么变化"——对世界负责，一对多。
 
-### 1.6 其他
+一笔全额成交对世界的变化 = 若干笔成交，这些已经作为 `Trade` 事件报完了；它没有簿变化（订单从未挂过簿）、没有拒绝。什么都没有发生，就没有事件。反过来若规定"每笔单结束都补一个终态事件"，观察者收到的信息是冗余的（它自己能从成交事件推导），还强迫引擎维护"订单生命周期状态机"的全部阶段。我们选**事实流**模型：**无变化，无事件**。
 
-- 余量挂簿**带上主动单的账户**（`Order r = o` 自然携带）；
-  此后别人撞上这本余量时按其账户判 STP。
-- 被撤/被砍的订单 id 照常可复用。
-- `MatchingEngine` 依旧不可拷贝、可移动。
-- 事件类型全部放进 `matching_engine.h`（不新建头文件——`Event` 需要 `RejectReason`，
-  拆头会引入循环包含；真想拆，先把 `RejectReason` 抽到独立头，作为思考题）。
+（对照领域模型：FIX 协议的 execution report 是"订单生命周期"模型的代表——Accepted / PartiallyFilled / Filled / Canceled 逐个阶段上报。那是为"一方需要精确跟踪自己订单状态"设计的；我们这里那条需求由 `SubmitResult` 承担。两个模型都能用，我们的划分是：**状态流给调用者，事实流给世界。**）
+
+### 1.3 用一个个字段回答"消费者需要知道什么"
+
+现在给 `Event` 设计字段。方法是把消费者具象化——假设要写一个**行情镜像模块**（维护一份和引擎一致的簿）和一个**风控模块**（监控账户行为、拒绝原因），看它们在每种事实里各需要什么：
+
+- 行情镜像收到 Trade：要**成交价、成交量、方向**，还要**双方订单 id**（行情明细/回放到订单级）；
+- 行情镜像收到 OrderRested：要**订单 id、价格、量、方向**才能把这笔挂进自己的镜像；
+- 行情镜像收到 OrderCanceled：要**订单 id**（从镜像里删掉）与**取消量**（对账）；
+- 风控收到一切：还要知道**账户**（否则 STP 类规则没法写——这也预告了 §2 为什么要给订单加账户）；
+- 风控收到 OrderRejected：要**原因码**。
+
+把这些需求求并集，再减去"引擎里根本没有的信息"，得到字段：
+
+```cpp
+struct Event {
+    EventKind            kind;                       // 这条事实是四类里的哪一类
+    maelstrom::OrderId   order_id{0};                // 事实的主体：哪笔订单
+    maelstrom::AccountId account{0};                 // 主体属于哪个账户
+    maelstrom::Side      side = maelstrom::Side::Sell; // 主体方向
+    maelstrom::OrderId   counterparty_id{0};         // 仅 Trade：对手方订单 id
+    maelstrom::Price     price{0};                   // Trade=成交价（被动价）/ Rested=挂单价
+    maelstrom::Quantity  quantity{0};                // Trade=成交量 / Rested=挂簿量 / Canceled=取消量
+    RejectReason         reason = RejectReason::None; // 仅 OrderRejected
+};
+```
+
+每种事实的字段含义（`{0}` 表示该字段在这种事实里没有意义，保持默认值）：
+
+| 字段 | Trade | OrderRested | OrderCanceled | OrderRejected |
+|---|---|---|---|---|
+| `order_id` | 主动单 id | 挂簿的单 id | 被取消的单 id | 被拒的单 id |
+| `account` | 主动方账户 | 该单账户 | 该单账户 | 该单账户 |
+| `side` | 主动方向 | 该单方向 | 该单方向 | 该单方向 |
+| `counterparty_id` | 被动单 id | `{0}` | `{0}` | `{0}` |
+| `price` | 成交价（被动方价格） | 挂单价 | `{0}` | `{0}` |
+| `quantity` | 成交量 | 挂簿量 | 取消量 | `{0}` |
+| `reason` | None | None | None | 拒绝原因 |
+
+两个设计决定值得单独说：
+
+**为什么是一个结构体加 tag，不是 `std::variant<TradeEvent, RestedEvent, ...>`？** 这是真实的取舍，两种都对：
+
+- `variant` 的优点：类型安全——读不到"不属于该种类"的字段，编译期杜绝了"给 Rejected 读 price"这类错误；缺点是每个消费者都要写 `std::visit`，写日志/序列化要按类型分别处理，调试时也不便整体打印；
+- 固定结构体（本项目的选择）的优点：一条事件就是一个可整体拷贝/打印/memcmp 的值，订阅端一个 `switch (e.kind)` 走完；代价是"无效字段"占位置（每种事实浪费几十字节的 `{0}`），且语义靠契约与测试钉住而非编译器。
+
+W4 的目标是"多订阅者 + 顺序 + 正确性"，观测数据量还远没到需要抠字节的时候；`variant` 版本列入扩展清单（文末「迁移练习」会让你评估它要改多少东西）。
+
+**每个字段必须有默认值——这是类型契约，不是风格。** `Event ev{};` 之后每个字段都必须处于确定状态。上一周你已经为这条纪律付出过代价：你的 `SubmitResult` 少了默认成员初始化，差分 oracle 从你的类型里读出了未初始化的 `reason`——语义单测全绿，**只有差分测试能看见"类型对外契约"层面的问题**。W4 的 `EventDefaultsAreZeroed` 用例做的就是同一件事：钉死"`Event ev{}` 后六个数值字段全 0、reason 为 None"。
+
+### 1.4 订阅的身份、退订与顺序
+
+补齐 §1.1 的 A2/A3 两条缺口。
+
+**订阅需要身份（`SubscriptionId`），而不是下标。** 理由在 B1 硬伤 1 已给出（erase 让下标错位）。给每个订阅发一个号：
+
+```cpp
+using SubscriptionId = std::uint64_t;
+SubscriptionId subscribe(Handler handler);  // 返回订阅号，从 1 开始
+bool unsubscribe(SubscriptionId id);        // 精确退订；不存在返回 false
+```
+
+**订阅号从 1 单调递增、永不复用。** 为什么不复用？一个具体的事故场景：风控模块持有 id=2，打算延迟退订（比如"处理完当前批次再退"）；期间它先退订了 2，另一个新订阅者拿到空闲的 2；风控的延迟退订到达，把**新订阅者**杀了。"下标复用"和"id 复用"是同一类 bug（悬垂句柄指向了别人）。单调递增让一个 id 在任何时刻只可能指向"当初拿到它的那个人"，退订语义从此无歧义。代价只是 `uint64_t` 永远涨——每秒订阅 10 亿次也要 500 年才回绕，可以忽略。
+
+**投递顺序 = 订阅注册顺序，同步送达。** 两个决定各自的理由：
+
+- **顺序**：事件流的一部分消费者是"记录流"（日志、回测），它们需要确定且可重现的顺序。按注册顺序遍历是最便宜、最容易讲清楚的默认；需要更复杂顺序策略的场景这里不存在。
+- **同步**：`publish` 在 `submit` / `cancel` 返回前把所有事件全部送达。这样调用者可以把"世界已经知道这件事了"当作返回后的既定事实（你的日志一定写在 `SubmitResult` 被检查之前）。代价是：**慢订阅者会拖慢撮合**。解耦它需要异步队列 + 并发，那正是 W5 的题目——本周先用最简正确的同步版本，把复杂度记账，别提前还。
+
+**两条约定（测试不覆盖，但请遵守）**：
+
+- 分发期间不要 subscribe/unsubscribe（遍历 `vector` 时增删 = 迭代器失效）。我们不做防御（不复制副本、不加锁），单线程契约下这是"重入未定义"，文档写清楚即可；
+- 订阅者不要抛异常（会穿透 `submit`）。异常安全的分发策略是个正经话题，留到 W5 之后正式化。
+
+**W3 的 `set_trade_handler` 保留，与总线并行。** 理由有二：旧代码（和 W3 的 151 个测试）依赖它，换掉就是无谓的破坏性变更；它的语义也确实更窄更快（单消费者、只见成交）。总线捕获的事实集是它的超集——`BusAndTradeHandlerAreIndependent` 用例把"两条通道互不干扰"钉死。
+
+### 1.5 引擎在哪些时刻广播（发布点推导）
+
+有了消息与总线，还剩最后一个问题：**引擎的哪些代码行应该 `publish`？** 方法是把 W3 `submit` 的每个出口再走一遍，逐行问"这一行发生的事，世界需要知道吗"：
+
+| `submit`/`cancel` 的哪一步 | 可观察变化 | 发什么事件 |
+|---|---|---|
+| 五个校验分支任一命中 | 拒绝本身是事实（无市场变化） | `OrderRejected`（带 reason） |
+| 循环中吃掉对手盘队头 | 发生一笔成交 | `Trade`（紧随 `consume_best` 之后发，顺序即撮合顺序） |
+| STP-CancelOldest 撤掉一笔自己的挂单 | 簿少了一笔 | `OrderCanceled`（被撤的单，§2 详解） |
+| STP-CancelNewest 砍掉主动单余量 | 主动单死亡 | `OrderCanceled`（主动单，§2 详解） |
+| 余量挂入簿中 | 簿多了一笔 | `OrderRested` |
+| Market/IOC 余量被丢弃 | 主动单死亡 | `OrderCanceled` |
+| `cancel(id)` 成功 | 簿少了一笔 | `OrderCanceled` |
+
+七处发布点，一处不能少、一处不能多。漏一个的典型后果：观察者收到一串 `Trade` 之后什么都没有，它无法判断"余量挂簿了"还是"余量被丢掉了"——Market/IOC 那行（表里最容易漏的一处）就是把这种"静默死亡"变成事件的。多一个的典型后果：STP-CancelNewest 的取消在循环里已经发过，余量段如果按 Market/IOC 的逻辑再发一次，事件数就多了一（后面任务 4 会提醒你怎么防）。
+
+注意表里**没有"全额成交"这一行**——这正是 §1.2 "事实流"模型的推论：交易已报、无簿变化，就没有终态事件。
+
+**事件顺序的完整口径**：一个 `submit` 的事件序列 = **实际发生顺序**（成交与 CancelOldest 的撤销按撮合循环的时间顺序交错）＋**终态事件（若有）排在最后**；被拒的 submit 恰好一个 `OrderRejected`；`cancel` 成功恰好一个 `OrderCanceled`。
+
+### 1.6 需求 A 的正式契约
+
+```cpp
+// 多订阅者事件总线：同步分发，按订阅注册顺序逐一回调。
+class EventBus {
+public:
+    using Handler = std::function<void(const Event &)>;
+
+    SubscriptionId subscribe(Handler handler); // 从 1 递增，不复用
+    bool unsubscribe(SubscriptionId id);       // 不存在返回 false（含二次退订）
+    void publish(const Event &event);          // 按注册顺序同步分发
+    [[nodiscard]] std::size_t subscriber_count() const;
+};
+```
+
+- `EventBus` 是头文件内联的小类（不需要 .cpp）：`vector<槽位> + 自增 id` 就够了。
+- `MatchingEngine` 持有一个 `EventBus bus_;` 成员并对外转发：
+
+```cpp
+[[nodiscard]] SubscriptionId subscribe(EventBus::Handler handler);
+bool unsubscribe(SubscriptionId id);
+```
+
+- `Event` / `EventBus` / `EventKind` / `SubscriptionId` 全部放在 `matching_engine.h`（**不新建头文件**）：`Event` 需要 `RejectReason`（W3 就在这个头里），拆出去会形成循环包含。真想拆，先考虑把 `RejectReason` 抽到独立头——留作思考题。
+- 字段语义与默认值以 §1.3 的表为准；发布点以 §1.5 的表为准；订阅号从 1 开始、单调、不复用。
 
 ---
 
-## 2. 任务概览（做完一个打一个勾）
+## 2. 需求 B 的推导：自成交防护
 
-| # | 任务 | 改哪个文件 | 预计 |
-|---|---|---|---|
-| 1 | `AccountId` + `Order.account`（保持旧初始化兼容） | `include/Maelstrom/types.h` `order.h` | 30 min |
-| 2 | `SelfMatchPolicy` / `Event` / `EventBus` 类型设计 | `include/Maelstrom/matching_engine.h` | 1–1.5 h |
-| 3 | STP 进撮合循环（执行接触点判定） | `src/matching_engine.cpp` | 2–3 h |
-| 4 | 引擎事件发布点（submit / cancel 全程） | `src/matching_engine.cpp` | 1–2 h |
-| 5 | 把裁判挂进构建 | `tests/CMakeLists.txt` | 10 min |
-| 6 | 语义 + 总线全绿 + 口试自检 | 只读不写 | 1–2 h |
-| 7 | 内存/UB 门禁 + 差分全绿 + 提交 | 只读不写 | 1–2 h |
+### 2.1 判定放在哪里：为什么不是"下单前扫描"
+
+先写一个自然的基线：**在 `submit` 入口处扫描对手侧，发现"自己的挂单且价位与我的限价交叉"就处理**。它看起来覆盖得挺全，但有一个具体的过度拦截反例：
+
+```
+簿上：别人的卖单 100 × 10（最优），你自己的卖单 102 × 4
+新单：买 5，限价 102
+入口扫描：对手侧有自己的挂单 102，与限价 102 交叉 → 判定为自成交冲突，拦下
+实际执行：100 档的 10 手完全够吃这 5 手，单子全额成交，根本碰不到 102 —— 不该拦
+```
+
+一句话：**"价位在我的限价范围内"不等于"我会碰到它"**。撮合逐档推进，深档位的"自己人"在前面的档位被吃完之前永远不会被触及。入口扫描的毛病有两条：**语义上过度拦截**（把永远不会碰到的自己人算成冲突），**成本上最坏 O(全簿)**（热路径上每次提交都扫一遍对手侧）。
+
+同一原则的另一半由 `MatchingW4.StpTriggersOnlyAtContactNotWholeBook` 钉住：自己账户在 102 的挂单，限价 101 的新单吃到 100 档后余量正常挂在 101，自己的那笔挂单动都不动。
+
+第二个候选是"成交后再冲销/撤销"。直接排除：成交是**不可回滚**的——事件已经广播、被动单可能已经被吃光、对方账户的成交是真的。防御必须在交易发生**之前**。
+
+正确的判定点于是唯一地确定下来：**撮合循环内，交叉判定通过之后、`consume_best` 之前**——也就是"这笔成交即将发生"的瞬间，只看**队头这一笔**。
+
+为什么只看队头就够？因为撮合循环每次只吃队头（W3 的 `consume_best` 语义），冲突也只可能在队头发生；更深的挂单还没轮到被碰。这个位置每次判定是 O(1)，语义上恰好是"执行接触点判定"（judge at the point of execution）——真实交易所的 STP 普遍也是这个口径。
+
+### 2.2 用什么识别"自己"：账户、0 号哨兵与向后兼容
+
+"自己人"需要身份。`Order` 上目前没有主体信息，所以需要加一个账户字段。三个决定：
+
+**决定 1：`Order` 追加 `AccountId account{0}`（新增强类型，放在 `type` 之后）。** 沿用 W3 加 `type` 时的全套纪律：追加在最后、带默认值、不给聚合类型加构造函数——这样 W1/W2 的四段初始化和 W3 的五段初始化原样编译通过。`AccountId` 照 `OrderId` 的模板做（构造 + `get()` + 比较）：账户和订单都是一段 `int64`，强类型让"把账户当订单传"这类错误在编译期消失，这是 W1 就立下的规矩，继续执行。
+
+**决定 2：`account == 0` 表示"没有账户信息"，永不触发 STP。** 触发条件因此是 `o.account != 0 && best->account == o.account`。
+
+为什么要这个豁免？两个层面的理由，一个工程一个语义：
+
+- **工程（向后兼容）**：W3 的全部订单都没有账户（默认 0）。若 0 也参与 STP，任何两笔 W3 订单都会被当成"同一主体"而互相拦截——W3 的 151 个测试与 40 个差分种子会当场全线变红。0 豁免把"没提供账户信息"的旧订单语义原样保留。
+- **语义**：0 是**保留的"空账户"**——账户 id 由系统分配（本项目和真实 OMS 一样，不会给一个真实主体分配 0）。"没有提供信息"不能推断出"同一主体"，所以不触发。代价也如实写进契约：**匿名订单得不到防护**，调用方想要 STP 就必须带账户。
+
+**决定 3：非 0 即可触发——负数账户也算。** 判据是 `!= 0` 而不是 `> 0`（`MatchingW4.NegativeAccountIdStillTriggersStp` 钉住：account=-5 的买单撞上 account=-5 的挂单照样触发）。账户 id 的值域是"除 0 外的任何 int64"。
+
+**一个值得停留的对比**：W3 你刚学过"别用哨兵值表达语义"——Market 单的 `price` 不参与判定，我们拒绝"`price == 0` 当市价"这种写法，坚持由 `OrderType` 承担语义。为什么这里却接受"0 号哨兵"？因为两者性质不同：
+
+- Market 的"无限价"是一种**语义模式**（影响校验、撮合、FOK 等一整串行为），它应该由类型的维度（`OrderType`）表达；
+- 账户的 0 是**同一个维度上的一个保留取值**（"是不是某个主体"，0 = 无主体），用值表达是自然的，前提是把约定写进契约并用测试钉死。
+
+替代方案是 `std::optional<AccountId> account;`——类型层面显式表达"可能没有账户"，编译器帮你防混淆。它完全可行（聚合初始化也兼容），取舍在于：`Order` 会离"简单的字段集合"远一步、热点路径多一层分支语义、而现有测试的契约已把"0 = 无账户"钉死。这里选哨兵的理由主要是**兼容与简单**；如果你在别的项目里更想要 `optional`，那也是一个有理由的选择——把选择依据（值域约定 vs 类型显式性）想清楚，比选哪个更重要。
+
+### 2.3 碰撞后谁让路：策略空间与本周的两个选择
+
+触发条件一旦成立，"自己撞自己"必须由某一方让路。真实交易所的 STP 策略空间大致五种，先看全貌再收窄：
+
+| 策略 | 让路的是谁 | 说明 |
+|---|---|---|
+| **CancelNewest** | 撞上来的新单 | 新单余量被取消，老挂单不动 |
+| **CancelOldest** | 已有的老挂单 | 老挂单被撤，新单继续找对手 |
+| CancelBoth | 双方 | 新单余量 + 老挂单一起取消 |
+| Decrement | 双方各让一部分 | 把两边减量到"刚好不交叉"再收手 |
+| RejectIncoming | 新单整单 | 直接拒绝，连"已成交的部分"都要求不发生 |
+
+本周实现**前两个**，理由是它们恰好覆盖两个方向的所有权决策：一个改**在途订单**（CancelNewest：杀主动单），一个改**簿上订单**（CancelOldest：杀被动单）。把两套代码路径都亲手写一遍，"策略差异应该收敛到哪里"这个问题你才有实感。其余三种、以及"按账户对配置不同策略"列入扩展清单。
+
+两个策略的语义，逐条推到清楚：
+
+**CancelNewest（默认策略）——杀主动单余量：**
+
+- 已经成交的部分**保留**。那些成交的对手是**别的账户**，是真实发生、已经广播的市场事件——不可能"收回"。STP 只解决剩余的冲突（`StpCancelNewestKeepsEarlierTrades`：先吃 acct1 的 5 手，再撞上 acct7 自己的挂单，余量 5 被砍，成交序保留 1 笔）。
+- 被撞的**挂单纹丝不动**。它是先来的、无辜的（`StpCancelNewestBlocksAndCancelsRemainder`：撞上自己的挂单后，那笔挂单原样还在簿上）。
+- 余量**不挂簿**。为什么不能挂？见 §2.4。
+- 发一个 `OrderCanceled{主动单 id, quantity=被取消的余量}`。
+- outcome：`resting == 0 且 filled < quantity` → 落进 W3 既有的 **`Cancelled`** 分类（这句话很重要，§2.4 展开）。
+
+**CancelOldest——杀被动挂单：**
+
+- 撤掉队头那笔**自己的挂单**（整单；等价于对它做一次 `cancel`：摘链、删空档、释放，发行情里"簿少了一笔"的 `OrderCanceled{被撤单 id, quantity=其剩余量}`）。
+- 主动单**不消耗任何量**（没有成交发生），继续循环找下一个对手：同价下一笔如果又是自己的，再次触发，**依次后撤**——`StpCancelOldestChainsThroughMultipleOwn` 就是这个链式场景（撤 id1、撤 id2、成交 id3、余量挂簿，事件流以此为序）。
+- 之后主动单可能成交、可能余量挂簿（`StpAgainstOwnRestingRemainderCancelOldest`：撤掉自己的买一后，卖单余量挂上了卖盘）。
+
+### 2.4 两个必须想清楚的后果
+
+**后果 1：CancelNewest 的余量绝不能挂簿——否则簿当场交叉。**
+
+想一个具体反例：买 10@100 撞上自己卖 5@100。此刻对手侧最优价 100 与买价 100 交叉。如果按"普通限价单余量挂簿"的逻辑，把这 10 手挂回买盘 100——而自己那笔卖单还挂在 100 档——簿上立刻变成 `best_bid(100) >= best_ask(100)`，**交叉簿**。W2/W3 维持了一整周的"簿上不存在可成交的两笔单"不变量，被这一行代码打破；而且状态自相矛盾：你刚刚才判定"这笔单不该与那笔单成交"，却把两笔都留在了簿上等着别人来看。
+
+所以 CN 的余量必须**消失**（撤销即死）。这也是为什么实现里需要一个 `self_killed` 标记：余量处理段（W3 里那句 `can_rest = (type == Limit || PostOnly)`）必须知道"这笔单的余量是被 STP 砍掉的，不许挂"。没有这个标记会发生什么，差分测试会在第一个种子就抓住：`resting` 与簿状态全错，而且簿可能交叉。
+
+**后果 2：CancelOldest 的循环必然终止。**
+
+CO 的每次循环迭代只有三种可能：撤掉一笔挂单（簿严格缩小）、成交一笔（remaining 严格缩小）、或 break。两者都是有界量，所以有限步内终止，不会死循环。顺手确认另一件事：撤的只可能是**对手侧**的挂单（触发条件是"队头与我对撞"），所以永远不会撤掉主动单自己。
+
+**顺带一个漂亮的性质：outcome 不需要任何新规则。** 看 CN 的结局——`resting == 0`、`filled < quantity`——W3 的 outcome 规则表自动把它分类为 `Cancelled`；CO 的结局可能落在 `Filled / PartiallyFilled / Rested / Cancelled` 里的任何一个，也全部由既有规则决定。你的工作只是**正确维护状态**（余量去哪、簿怎么变），结果分类自己就对了。这是契约扩展时值得体会的信号：**如果需要给 outcome 加新值，往往说明状态维护出了偏差**。
+
+### 2.5 预检的"账户盲区"：一个被刻意保留的语义缝
+
+W3 的两个预检（POST-ONLY 的交叉预判、FOK 的 `matchable_quantity`）现在面临一个新问题：它们要不要也看账户、把"自己人的挂单"从可成交量里剔除？我们的决定是**不看**，理由两条：
+
+- **成本**：`matchable_quantity` 现在按价位累加档量（O(档位数)）。要看账户就得按账户聚合对手侧可成交量——簿上没有按账户的索引，最坏退化成 O(挂单数)。热路径预检为了一个边角语义付出这个代价不划算。
+- **语义**：FOK 的含义应该保持"市场里有没有这么多流动性"这一纯价格问题；"这些流动性里哪些不能碰"是主体问题。把两个机制揉进同一个判定，FOK 的拒绝原因就不再纯粹，两个模块也无法各自独立测试。
+
+决定带来两个必须写进契约、并被测试钉死的后果：
+
+1. **FOK 可以通过预检、执行时被 STP 砍成部分成交 + `Cancelled`。** 具体：簿上 acct1 卖 3@100、acct7 卖 5@100，acct7 的 FOK 买 8@101——`matchable_quantity` 数出 8 ≥ 8，预检放行；执行时吃掉 acct1 的 3 手，撞上自己的 5 手，余量被砍。结局 `Cancelled, filled=3`（`StpFokPrecheckBlindThenCancelledByNewest`）。**看见它别当 bug 报——它是契约。**
+2. **POST-ONLY 撞上自己账户的最优价，照样按 `PostOnlyWouldCross` 拒绝**（`StpPostOnlyPrecheckBlindToAccount`）——"会不会取走流动性"用的也是价格口径。
+
+替代方案（把 STP 折进预检）是可行的，但要付两笔代价：簿要维护按账户的可成交量聚合（数据结构改造），且 FOK/STP 的联合语义要重新定义（"被 STP 挡住"算不算"not fillable"？拒绝还是降级成交？真实交易所两种口径都有）。这作为扩展思考留给你，不要求本周实现。
+
+### 2.6 需求 B 的正式契约
+
+- **触发条件**：撮合循环内、交叉判定通过后、吃单前，**只看队头这一笔**：
+  `o.account != 0 && best->account == o.account`（非 0 即触发，负数也算）。
+- **CancelNewest（默认）**：主动单余量全部取消（已成交部分保留）；队头挂单不动；余量不挂簿；
+  发 `OrderCanceled{主动单, quantity=余量}`；outcome 由既有规则自然落 `Cancelled`。
+- **CancelOldest**：撤销队头挂单（整单，发 `OrderCanceled{该单, quantity=其剩余量}`）；撮合继续，
+  可连续撤销多笔；主动单不消耗量。
+- **策略切换**：`set_self_match_policy(policy)` 随时可调，只影响其后的 `submit`；默认 `CancelNewest`。
+- **预检保持账户盲**（§2.5）；**账户不参与校验**（除 0 外任何 int64 都是合法账户）。
+- **余量挂簿携带账户**（`Order r = o;` 自然带上）：此后别人撞上这本余量，按它的账户判 STP。
+
+对应到类型：
+
+```cpp
+enum class SelfMatchPolicy : std::uint8_t {
+    CancelNewest, // 撞上自己的挂单：主动单余量取消，挂单不动
+    CancelOldest, // 撞上自己的挂单：撤掉该挂单，撮合继续
+};
+```
 
 ---
 
-## 任务 1 ｜ 给 Order 装上账户
+## 3. 验收方式的变化：事件流为什么也要进差分
 
-**① 问题**
+W4 的验收为什么必须扩展而不是重复 W3 的 76 个用例？因为这次同时动了两样东西：
 
-STP 的前提是知道"这单是谁的"。和 W3 加 `type` 时一模一样的困境：`Order` 是聚合类型，
-W1/W2/W3 的代码都在用四段/五段初始化，插字段或加构造函数都会炸一片。
+1. **状态空间炸了**：账户（0/1/2）× 五种订单类型 × 两种策略 × 事件序列，手写用例只能枚举"想得到的"组合——"FOK 通过预检后被 STP 砍掉""IOC 连续撞三笔自己的挂单""策略在会话中途切换"这类交叉场景，靠手写是覆盖不完的。
+2. **输出多了一条通道**：`SubmitResult` 是**汇总结果**（一个数量守恒的摘要），而**事件流是顺序敏感的完整契约**——第 k 个事件的每个字段、它的先后位置，都在契约里。下一段的教训说明了"顺序敏感 + 逐字节"的契约面为什么必须由差分来守。
 
-**② 提示**
+所以 W4 的差分机制这样升级：
 
-1. `types.h` 里照抄 `OrderId` 的模板加 `AccountId`（构造、`get()`、`==`/`!=`）。
-   强类型防的就是"把账户 id 当订单 id 传进去"这种事故——两个 int64 别名在 ABI 上没差，
-   在类型系统里是两个世界。
-2. `order.h` 里**最后一行**加 `AccountId account{0};`——放最后、带默认值、不加构造函数，
-   三条纪律沿用 W3 任务 1。0 的语义在判据 1.1：未设置，永不触发 STP。
-3. 想清楚为什么 0 要豁免：如果默认账户也参与 STP，所有没设置账户的老订单互相都"自成交"，
-   W3 的差分测试当场全红。0 = 匿名单，这是**向后兼容**和**领域语义**的交点。
+- **oracle 同步升级**：参考引擎（`naive_matching_engine_w4.h`）在慢速直白风格上增加账户、STP 两策略、事件记录；每一步产出三元组 **(SubmitResult, 事件流, 簿状态)**，与你的引擎逐项比对。
+- **40 个种子分工**：奇数种子跑 CancelNewest、偶数种子跑 CancelOldest，保证两种策略都被大量随机场景扫过；随机注入非法价/量（沿用 W3）。
+- **失败信息自带现场**：`seed / step / policy / type / side / acct`，事件不一致时还给第几个事件与双方的 `kind`。
 
-**③ 理想效果**
+**上一周的教训回放**：W3 差分测试曾经是你唯一抓住"`SubmitResult.reason` 未初始化"的那层验收——语义单测看不见"类型对外契约"。今天事件流把契约面扩大了一个量级（每条事件 8 个字段 × 顺序），差分的价值同步放大：**它不关心你的引擎"看起来对不对"，它把你引擎对外吐出的每一个字节都当作契约来核对。**
+
+---
+
+## 任务 1 ｜ 给订单装上账户
+
+**① 目标（可验收）**
+
+`Order` 以追加方式获得 `AccountId account{0}`；`cmake --build` 通过；`ctest` 的 151 个旧测试**一行不改**仍全绿；后续 STP 用例能表达"同一主体"。
+
+**② 为什么现在做不到**
+
+STP 的触发条件需要判定"这两笔单是不是同一个主体"（§2.2），而 `Order` 没有位置表达主体。同时 `Order` 是聚合类型，直接插字段或加构造函数会连累 W1/W2/W3 的全部旧代码——这是你在 W3 加 `type` 时处理过的同一类课题，再练一遍。
+
+**③ 提示**
+
+1. `types.h` 里照 `OrderId` 的模板加 `AccountId`（构造、`get()`、`==`/`!=`）。强类型的意义：账户和订单在 ABI 上都是一段 int64，在类型系统里是两个世界。
+2. `order.h` 里把 `AccountId account{0};` 加在**最后一行**——三条纪律：放最后（聚合初始化按声明顺序填，旧写法省略它）、带默认值（`{0}` 的语义见 §2.2：无账户，永不触发 STP）、**不加构造函数**（保持聚合类型）。
+3. 注意新增后的字段顺序是 `{Price, OrderId, Quantity, Side, OrderType, AccountId}`——W4 测试的 `mk()` 按这个顺序构造六段初始化。
+
+**④ 验收**
 
 ```bash
 cmake --build build -j
-ctest --test-dir build    # W1-W3 的 151 个测试仍全绿
+ctest --test-dir build          # 151 个旧测试全绿 —— 你没破坏任何东西
 ```
 
-**④ 答案**：附录 A1。
+**⑤ 常见错误**
+
+| 症状 | 病因 |
+|---|---|
+| 旧测试编译失败 | 字段插在了 `type` 之前；或给 `Order` 加了构造函数（聚合性丢失） |
+| 行为诡异 | 漏写 `{0}`（账户处于不确定值，可能随机触发 STP） |
+| 想当然的"改进" | 把 `Order` 改成封装类——W1–W3 的一切依赖聚合初始化的代码全炸 |
+
+**⑥ 答案**：附录 A1。
 
 ---
 
 ## 任务 2 ｜ 事件类型与总线（类型设计先行）
 
-**① 问题**
+**① 目标（可验收）**
 
-事件系统最容易写成"随手往回调里塞参数"。你需要先回答：事件有哪几种？
-每种哪些字段有意义？订阅怎么标识、怎么退订、按什么顺序收？
-这些问题不先定清楚，写引擎发布逻辑时会反复返工。
+`SubscriptionId` / `EventKind` / `Event` / `EventBus` / `SelfMatchPolicy` 全部就位且与 §1.3、§1.6、§2.6 的契约一致；`Event` 的六个数值字段与 `reason` 都有默认成员初始化（`EventDefaultsAreZeroed` 会钉）；`MatchingEngine` 增加三个转发方法（`subscribe` / `unsubscribe` / `set_self_match_policy`）与成员 `bus_`、`policy_ = CancelNewest`。库编译通过，旧的 151 个测试仍全绿（只加类型，没动行为）。
 
-**② 提示**
+**② 为什么先做类型**
 
-1. `EventKind` 四个值别多别少（判据 1.1）。注意"全额成交不发终态事件"——
-   事件流的口径是**市场可观察事实**，不是"给每个 outcome 配一个事件"。
-2. `Event` 用 tag + 字段的结构体而不是 `std::variant`：字段固定、可以整体写日志/memcmp，
-   简单可调试；variant 是后续扩展方向（W8 之后的事）。
-   每个字段给默认成员初始化（`{0}` / `None`）——W3 差分测试抓过未初始化的 `reason`，
-   默认值是类型契约的一部分。
-3. `EventBus` 就是一个 `vector<槽位>` + 自增订阅号：subscribe 尾插、unsubscribe 按 id 删、
-   publish 按序遍历。它是**头文件内联实现**的小类，不需要 cpp。
-  分发期间改订阅集合未定义（判据 1.4），文档里写清楚即可，不用加锁。
-4. 为什么 `Event` 要放 `matching_engine.h`？它需要 `RejectReason`（W3 定义的），
-   拆新头文件会循环包含。内聚在一个头里，CMake 一行都不用改。
+事件系统最容易写成"随手往回调里塞参数"，返工成本高。§1.2 已经推导出消息种类、§1.3 推导出字段、§1.4 推导出总线语义——现在把这些推导**落成类型**，再动引擎。类型没定对，发布点写多少返工多少。
 
-**③ 理想效果**
+**③ 提示**
 
-```bash
-cmake --build build -j        # 库能编过
-```
+1. 把 §1.3 的字段表直接翻译成结构体，**字段顺序照抄**（差分测试逐字段比对，顺序错了是编译错误；名字对了但语义错了是差分红）。
+2. `EventBus` 是头文件内联的小类：`vector<Slot>`（`Slot = {id, handler}`）+ `next_id_ = 1`。`subscribe` 尾插并返回自增前的 id；`unsubscribe` 线性找 id、找到则 erase 并返回 true；`publish` range-for 顺序调用。都不复杂——把"为什么这么简单"讲得出来（§1.4）比写出来更重要。
+3. `Event` 放 `matching_engine.h`，不新建文件（§1.6 讲了循环包含的原因）。
+4. `MatchingEngine` 里 `policy_` 的默认值是 `CancelNewest`——默认策略的选择写进契约（§2.6）。
 
-你现在应该能口头背出：`Event` 八个字段分别是什么、四种事件各自哪些字段有值、
-订阅号从几开始、分发按什么顺序。
-
-**④ 答案**：附录 A2。
-
----
-
-## 任务 3 ｜ 自成交防护进撮合循环
-
-**① 问题**
-
-W3 的撮合循环是一条直线：取队头 → 判交叉 → 吃。STP 要在这条直线的"吃"之前
-插一个判定点，而且两种策略的行为完全不同（一个杀主动单、一个杀被动单）。
-难点不是写，是**边界**：撞上自己时余量还挂不挂？连续撞上两笔自己的单呢？
-FOK 已经通过预检了还要不要执行？判定提前到"扫全簿"行不行？
-
-**② 提示**
-
-1. 判定点只有一个位置：循环内、`consume_best` 之前、交叉判定之后。
-   判据 1.2 的触发条件照抄：`account != 0 && best->account == o.account`。
-2. `CancelNewest`：发 `OrderCanceled{主动单, quantity=remaining}` → 置一个
-   `self_killed` 标记 → break。**余量处理必须排除被砍的单**：can_rest 要看这个标记，
-   否则被砍的余量又挂回簿上（差分会抓到）。outcome 走 W3 的老规则自然落 `Cancelled`
-   （resting=0、filled<original），不用新分支。
-3. `CancelOldest`：发 `OrderCanceled{队头单, quantity=其剩余量}` → `book_.cancel(队头id)`
-   → `continue`（不消耗 remaining）。注意终止性：每轮要么撤一笔（簿缩小）、要么吃一笔、
-   要么 break，不会死循环。
-4. 预检（任务 3 里）**一个字都不改**：POST-ONLY 和 FOK 继续对账户失明。
-   判据 1.2 的"刻意取舍"段讲清楚了为什么。
-5. "只在接触点判定"意味着：自己 deeper 价位的单不拦截——先吃别人的，走到自己那笔才触发。
-
-**③ 理想效果**
+**④ 验收**
 
 ```bash
 cmake --build build -j
-./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Stp*'   # 先绿这一族
+ctest --test-dir build    # 151 仍全绿；W4 测试现在红是预期的（引擎还没发事件、没做 STP）
 ```
 
-做完后你能回答：**"CancelNewest 之后我的余量去哪了？CancelOldest 连续撞三笔自己的单
-发几个事件？"**（前者： nowhere，被砍了，标记保证不挂簿；后者：三个 `OrderCanceled`。）
+**⑤ 常见错误**
 
-**④ 答案**：附录 A3。
+| 症状 | 病因 |
+|---|---|
+| 差分全红在"字段不一致" | `Event` 字段顺序/类型与契约不符（如 `account` 用了 `int64_t` 而不是 `AccountId`） |
+| `EventDefaultsAreZeroed` 红 | 漏了某个默认成员初始化 |
+| `SubscriptionIdsStartAtOneAndNeverReuse` 红 | 从 0 开始；或退订后把 id 回收复用 |
+| `SubscriberCountTracks` 红 | `unsubscribe` 没真删/删错元素 |
+
+**⑥ 答案**：附录 A2。
+
+---
+
+## 任务 3 ｜ STP 进撮合循环
+
+**① 目标（可验收）**
+
+`MatchingW4.Stp*` 一族的 10 个用例，加上同族的 4 个边界用例（`ZeroAccountNeverTriggersStp` / `DifferentAccountsTradeNormally` / `PolicySwitchMidStream` / `NegativeAccountIdStillTriggersStp`）共 14 个全绿；碰撞路径上的簿状态、事件、outcome 逐条符合 §2.6。
+
+**② 为什么上面那些用例现在全红**
+
+引擎还不知道"自己人"存在。而 §2.1–§2.4 已经把判定位置（接触点）、触发条件（非 0 同账户）、两种策略的行为、以及两条后果（余量不挂簿、循环终止）全部推导清楚——任务就是把它们落成代码。
+
+**③ 提示**
+
+1. **单点插入**：循环内、`crosses` 通过之后、`consume_best` 之前。只判队头。
+2. **CancelNewest**：发 `OrderCanceled{主动单, 余量}` → 置 `self_killed = true` → `break`。关键联动：余量段的 `can_rest` 必须排除 `self_killed`，否则被砍的余量挂回簿上（§2.4 的交叉簿反例）。outcome 不需要新代码——既有规则自动落 `Cancelled`。
+3. **CancelOldest**：发 `OrderCanceled{队头单, 其剩余量}` → `book_.cancel(队头 id)` → `continue`。注意不消耗 `remaining`，且"同价下一笔可能又是自己的"（链式撤销由循环自然处理）。
+4. **不要动预检**。POST-ONLY 与 FOK 保持账户盲（§2.5）——如果你"顺手"让预检也看账户，`StpFokPrecheckBlindThenCancelledByNewest` 和 `StpPostOnlyPrecheckBlindToAccount` 会立刻红，而且那是**契约层面**的红，不是实现 bug。
+5. 推进顺序建议：先让 `StpCancelNewest*` 一族绿（最简单）→ `StpCancelOldest*` → `PolicySwitchMidStream` / `NegativeAccountId` 收尾。
+
+**④ 验收**
+
+```bash
+./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Stp*'
+```
+
+**⑤ 常见错误**
+
+| 症状 | 病因 |
+|---|---|
+| CN 后 `resting` 不为 0 / 簿出现交叉 | 余量挂回簿了（`self_killed` 没接进 `can_rest`） |
+| CO 卡死或行为错 | 忘了 `continue`（或错误地消耗了 `remaining`） |
+| 负数账户不触发 | 用了 `> 0` 而不是 `!= 0` |
+| `StpFok*` / `StpPostOnly*` 红 | 把 STP 写进了预检（动了不该动的地方） |
+| CO 少发事件 | 撤挂单忘了发 `OrderCanceled` |
+
+**⑥ 答案**：附录 A3。
 
 ---
 
 ## 任务 4 ｜ 引擎事件发布点
 
-**① 问题**
+**① 目标（可验收）**
 
-STP 只改了循环中部；事件是**全程**的：拒绝要报、挂簿要报、Market/IOC 余量被取消要报、
-撤单要报——发布点散落在 submit/cancel 的每个出口。漏一个，差分测试的"事件数不一致"
-就会红；多发一个（比如 STP 砍单后余量又发一次取消），一样红。
+`MatchingW4.EventSequence*` / `MatchingW4.CancelEmits*` / `MatchingW4.BusAndTradeHandler*` 全绿；任一 `submit` / `cancel` 的事件流与 §1.5 的表逐条一致（条数、顺序、字段）。
 
-**② 提示**
+**② 为什么还不绿**
 
-1. 数一数发布点：**被拒（5 种原因，一个 lambda 统一发）、每笔成交、余量挂簿、
-   余量被取消（Market/IOC）、STP 两种取消、cancel 成功**。共 7 处。
-   沙盒验证时 AI 自己的第一版就漏了"Market/IOC 余量取消"这一处——差分红了一片，
-   这个发布点最容易漏。
-2. 拒绝路径用 lambda 收口：`auto reject = [&](RejectReason r) { 发 OrderRejected; return res; };`
-   五个 return 全走它，事件字段（order_id/account/side/reason）不会发岔。
-3. `cancel()` 要先 `book_.find(id)` **捕获**账户/方向/量，再撤、再发事件——
-   顺序反了就是拿着已释放的数据发事件（ASan 会教你做人）。
-4. 全额成交不发终态事件；别顺手"补对称"。
-5. W3 的 `handler_(t)` 原样保留，与 `bus_.publish(Trade事件)` 并列——两条独立通道。
+任务 3 只改了循环中部；事件是**全程**输出——拒绝、成交、挂簿、Market/IOC 取消、STP 两种取消、外部撤单，共七处出口，一处不能漏、一处不能重（§1.5 推导）。
 
-**③ 理想效果**
+**③ 提示**
+
+1. 数着 §1.5 的表写：**7 处**。最容易漏的是 Market/IOC 余量取消（原因：W3 里它只是个 outcome 分类，没有任何显式动作，容易被当成"没有事发生"）。
+2. **拒绝路径收口**：五个校验分支各写一遍发布是 bug 温床，用一个小 lambda（发 `OrderRejected` 并构造结果）让五个 `return` 全走它。
+3. **`cancel()` 的顺序**：先 `book_.find(id)` 捕获账户/方向/量 → `book_.cancel(id)` → 发布。顺序反了就是拿着已释放的数据发事件（ASan 会教你）。
+4. **CN 的去重**：CancelNewest 的取消事件已在循环里发过，余量段的 Market/IOC 取消分支要跳过（`!self_killed`）；否则事件数多一，差分第一个种子就红。
+5. **不要顺手补对称**：全额成交**不发**终态事件（§1.2 的事实流模型），别因为"看起来不整齐"给它补一个。
+6. W3 的 `handler_(t)` 原样保留（§1.4 末尾），与总线并行。
+
+**④ 验收**
 
 ```bash
-cmake --build build -j
 ./build/tests/maelstrom_tests --gtest_filter='MatchingW4.EventSequence*:MatchingW4.CancelEmits*:MatchingW4.BusAndTradeHandler*'
 ```
 
-**④ 答案**：附录 A3（与任务 3 同一段参考实现）。
+**⑤ 常见错误**
+
+| 症状 | 病因 |
+|---|---|
+| 差分"事件数不一致" | 漏发（最常见：Market/IOC 取消）或重复发（CN 取消） |
+| 差分"第 k 个事件不一致" | 字段填错（Rested 的 price/account 漏填）或顺序错（CO 的撤销没插在成交位置） |
+| ASan use-after-free | `cancel()` 先删后读 |
+| `BusAndTradeHandlerAreIndependent` 红 | 把某条通道整个换掉了，而不是并行 |
+
+**⑥ 答案**：附录 A3（与任务 3 同一段参考实现）。
 
 ---
 
 ## 任务 5 ｜ 把裁判挂进构建
 
-**① 提示**
+**① 目标**
 
-1. `tests/CMakeLists.txt` 的 `add_executable` 源列表加一行 `test_matching_engine_w4.cpp`
-   （和 W3 时一样，只改这一行）。`naive_matching_engine_w4.h` 是头文件，被测试源 include，不用登记。
-2. 库目标**不用改**：W4 没有新的 .cpp，也没有新的头文件（判据 1.6）。
-3. 重新配置再构建：
+裁判测试源被构建系统认识；一次全量构建后 W4 用例可被执行。
+
+**② 为什么需要**
+
+`tests/` 里已经躺着 76 个 W4 用例，但 `add_executable` 的源列表不认识新文件——不改 CMake，你写再多也没人告诉你对没对。
+
+**③ 提示**
+
+1. `tests/CMakeLists.txt` 的 `add_executable` 源列表加一行 `test_matching_engine_w4.cpp`（**只改这一行**，和 W3 时一样）。`naive_matching_engine_w4.h` 是头文件，被测试源 `#include`，不需要登记。
+2. 库目标**不用改**：W4 没有新的 .cpp，也没有新的头文件（§1.6）。
+3. 改了 CMake 必须重新配置再构建：
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
@@ -320,47 +575,44 @@ cmake --build build -j
 ```bash
 ./build/tests/maelstrom_tests --gtest_filter='MatchingW4.*'             # 语义 + 生命周期（28）
 ./build/tests/maelstrom_tests --gtest_filter='EventBusW4.*'             # 总线（8）
-./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Stp*'          # STP 一族
+./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Stp*'          # STP 主力一族（10）
 ./build/tests/maelstrom_tests --gtest_filter='Seeds/MatchingDifferentialW4.RandomSubmitSequence/7'
 ctest --test-dir build --output-on-failure                              # 全量（含 W1-W3，共 227）
 ```
 
-**③ 理想效果**
+**④ 验收**：上述命令能列出/运行对应用例（语义用例此时红着——预期内的红，是起跑线）。
 
-构建目前红着——**预期内的红**，是起跑线。你能说出 W4 交付的 =
-`Order.account`、`AccountId`、`Event`/`EventBus`、`MatchingEngine` 的
-STP（两策略）+ 事件发布 + 订阅转发。
-
-**④ 答案**：附录 A4（一处改动，一行）。
+**⑤ 答案**：附录 A4（一处改动，一行）。
 
 ---
 
 ## 任务 6 ｜ 语义 + 总线全绿 + 口试自检
 
-**① 提示**
-
-1. 跑语义与总线：
+**① 目标**
 
 ```bash
 ./build/tests/maelstrom_tests --gtest_filter='MatchingW4.*:EventBusW4.*'   # 28 + 8 = 36
+[  PASSED  ]  36 tests
 ```
 
-2. 失败时按族缩小（`Stp*` / `EventSequence*` / `Huge*` / `Lifetime*`）。
-   差分失败信息带 seed / step / 事件序号。
-3. **口试自检**（写进笔记）：
-   - 为什么 `account == 0` 永不触发 STP？如果默认账户也参与，W3 的哪些测试会红、为什么？
-   - CancelNewest 和 CancelOldest 在"成交序列、事件序列、outcome"三个维度上各有什么差别？
-   - 为什么 STP 判定放在执行接触点而不是下单前扫全簿？两种做法的复杂度和语义差别？
-   - FOK 通过了预检却被 STP 砍成 `Cancelled`——这是 bug 还是契约？为什么预检对账户失明？
-   - 为什么全额成交不发终态事件？"事件 = 市场可观察事实"这个口径排除了哪些设计？
-   - 为什么 `Event` 的每个字段必须有默认值？（W3 差分抓过一个未初始化的 `reason`，复述那次事故。）
-   - 一笔 IOC 连续撞上自己三笔同价挂单（CancelOldest），事件流长什么样？outcome 是什么？
+并且下面每个问题你能对着代码讲出来（写进笔记）。
 
-**③ 理想效果**
+**② 提示**
 
-```
-[  PASSED  ]  36 tests    ← MatchingW4.*（28）+ EventBusW4.*（8），全绿
-```
+1. 失败按族缩小范围：`Stp*` / `EventSequence*` / `Huge*` / `Lifetime*`；差分失败信息带 seed/step/policy/事件序号，抄下来可以二分定位。
+2. **口试自检**：
+   - `account == 0` 为什么永不触发 STP？把这个豁免删掉，W3 的哪些测试会红、为什么？
+   - CancelNewest 的余量为什么必须消失而不是挂簿？（提示：对着那个"交叉簿"反例讲。）
+   - CancelOldest 的循环为什么一定终止？它会不会撤掉主动单自己？
+   - CN / CO 在"成交序列、事件序列、outcome"三个维度上各有什么差别？
+   - 为什么判定放在执行接触点，而不是下单前扫全簿？（给出 §2.1 的过度拦截反例。）
+   - FOK 通过了预检却被 STP 砍成 `Cancelled`——这是 bug 还是契约？把 STP 折进预检要付什么代价？
+   - 全额成交为什么没有终态事件？"事件 = 市场可观察事实"这个口径如果换成"事件 = 订单生命周期"，契约会怎么变？
+   - `SubscriptionId` 为什么单调不复用？构造一个"复用会出事"的场景。
+   - 事件为什么必须同步发完再返回（`submit` 返回后，"世界已知"是可以依赖的事实）？异步化会把什么复杂度带进来（预告 W5）？
+   - 一笔 CancelOldest 的 IOC 连撞三笔同价自己的挂单，事件流长什么样？outcome 是什么？
+
+**③ 理想效果**：36 全绿，且上述问题能口头回答。
 
 **④ 答案**：无（口试题的答案就是你对代码的理解）。
 
@@ -368,10 +620,19 @@ STP（两策略）+ 事件发布 + 订阅转发。
 
 ## 任务 7 ｜ 内存/UB 门禁 + 差分对拍全绿 + 提交
 
-**① 提示**
+**① 目标**
 
-1. 先跑差分对拍（真实引擎 vs 带账户/STP/事件的慢速参考引擎，
-   40 个种子 × 400 步随机 submit/cancel，奇数种子 CancelNewest、偶数种子 CancelOldest）：
+1. 差分对拍全绿（40 种子 × 400 步，两策略各半）；
+2. ASan + UBSan + LSan 下 227 个全绿；
+3. 提交。
+
+**② 为什么这周的门禁更重**
+
+W4 新增了两个"释放后使用"的温床：`cancel()` 先删后读（发布点顺序错）、事件分发期间的订阅集合生命周期（subscribe/unsubscribe churn）。普通 Debug 构建下这些问题可能完全沉默——内存门禁与生命周期压力用例（`MatchingW4.Lifetime*`）就是为你把它们变成必然可见的失败而存在的。
+
+**③ 提示**
+
+1. 先跑差分与全量：
 
 ```bash
 cmake --build build -j
@@ -379,7 +640,7 @@ ctest --test-dir build --output-on-failure
 ./build/tests/maelstrom_tests --gtest_filter='Seeds/MatchingDifferentialW4.*'
 ```
 
-2. 再跑内存/UB 门禁（脚本会连 W1-W3 一起编）：
+2. 再跑内存/UB 门禁（脚本会用 ASan+UBSan+LSan 重编库与全部测试，只读源码、只写 /tmp）：
 
 ```bash
 scripts/run_sanitizers.sh                    # 全部（227 个）
@@ -387,37 +648,107 @@ scripts/run_sanitizers.sh 'MatchingW4.*'     # 只跑 W4 语义 + 生命周期
 scripts/run_sanitizers.sh 'MatchingW4.Lifetime*'
 ```
 
-3. 常见红与病因：
-   - 差分"事件数不一致" → 漏发/多发发布点（最常见：Market/IOC 余量取消忘了发；
-     STP 砍单后又走了一遍取消发布）。
-   - 差分"第 k 个事件不一致" → 字段错位（查 price 只在 Trade/OrderRested 有值）或顺序错。
-   - 差分"SubmitResult 不一致" → STP-CN 的余量被挂回了簿（查 can_rest 是否排除 self_killed）、
-     或 outcome 手工特判错了（W3 的 outcome 规则自动覆盖 STP，不需要新分支）。
-   - 差分"find(id) 不一致" → 余量挂簿没带账户、或撤单没删干净。
-   - 单测 EventDefaultsAreZeroed 红 → `Event` 字段缺默认成员初始化。
-   - `LifetimeStressAccountsStpPolicyChurn` 红 + ASan 报泄漏 → subscribe 了没退订、
-     或 cancel 路径先删后用。
+3. 差分报告怎么读（照着 §3 的三元组定位）：
 
-4. **提交**：
+| 报告 | 最可能的病灶 |
+|---|---|
+| 事件数不一致 | 发布点漏发/多发（Market/IOC 取消；CN 与取消事件重复） |
+| 第 k 个事件不一致 | 字段填错（Rested 的 price/account）或顺序错（CO 撤销位置） |
+| SubmitResult 不一致 | CN 余量挂回簿（resting 错）或 outcome 手工特判错 |
+| size / best / find / quantity_at 不一致 | 簿状态维护错（余量没带账户、撤销没清干净） |
+| cancel 返回值不一致 | 撤单路径 |
+
+4. **提交**（先确认在你的 W4 分支上）：
 
 ```bash
 git add -A
 git commit -m "W4: event bus + self-match prevention (cancel-newest/cancel-oldest)"
 ```
 
-**③ 理想效果**
+**④ 理想效果**
 
 ```
-# 普通 Debug 构建，全量 227 个（W1+W2+W3 的 151 + W4 的 76）
+# 普通 Debug 构建
 [==========] 227 tests from 9 test suites ran.
 [  PASSED  ] 227 tests.
 
-# 内存/UB 门禁（ASan+UBSan+LSan），同样 227 个
+# 内存/UB 门禁（ASan+UBSan+LSan）
 scripts/run_sanitizers.sh
 [  PASSED  ] 227 tests.               ← 无 sanitizer 报告 = 内存干净、无 UB
 ```
 
-**④ 答案**：无（这一步是验收与提交）。
+**⑤ 答案**：无（这一步是验收与提交）。
+
+---
+
+## 契约速查（调试对照表）
+
+> 本节是速查，不是学习材料。每一条的动机都在 §1/§2。测试红了，先来这里定位"违反了哪条"，再回去看它为什么长这样。
+
+**类型清单**
+
+| 名字 | 位置 | 一句话 |
+|---|---|---|
+| `AccountId` | `types.h` | 强类型账户 id；除 0 外任何 int64 |
+| `Order::account{0}` | `order.h` | 主体标识；追加在 `type` 之后 |
+| `SelfMatchPolicy{CancelNewest, CancelOldest}` | `matching_engine.h` | STP 策略；默认 CancelNewest |
+| `EventKind{Trade, OrderRested, OrderCanceled, OrderRejected}` | `matching_engine.h` | 四类可观察事实 |
+| `Event` | `matching_engine.h` | 八字段，除 kind 外全有默认值 |
+| `SubscriptionId = uint64_t` | `matching_engine.h` | 从 1 递增、不复用 |
+| `EventBus` | `matching_engine.h` | subscribe/unsubscribe/publish/subscriber_count |
+
+**Event 字段语义**（`{0}` = 无意义，保持默认）
+
+| 字段 | Trade | OrderRested | OrderCanceled | OrderRejected |
+|---|---|---|---|---|
+| `order_id` | 主动单 | 挂簿单 | 被取消单 | 被拒单 |
+| `account` | 主动方 | 该单 | 该单 | 该单 |
+| `side` | 主动方向 | 该单 | 该单 | 该单 |
+| `counterparty_id` | 被动单 | `{0}` | `{0}` | `{0}` |
+| `price` | 成交价（被动价） | 挂单价 | `{0}` | `{0}` |
+| `quantity` | 成交量 | 挂簿量 | 取消量 | `{0}` |
+| `reason` | None | None | None | 拒绝原因 |
+
+**发布点（7 处）**：拒绝（5 原因收口一个出口）/ 每笔成交 / 余量挂簿 / Market-IOC 余量取消 / STP-CN 砍余量 / STP-CO 撤挂单 / `cancel` 成功。全额成交**无**终态事件。
+
+**事件顺序**：实际发生顺序（成交与 CO 撤销按撮合顺序交错）+ 终态事件（若有）最后；同步发完再返回；多订阅按注册顺序。
+
+**STP 规则**
+
+| | CancelNewest | CancelOldest |
+|---|---|---|
+| 触发 | 循环内、交叉后、吃单前；`account != 0 && 队头账户相同`（只看队头） | 同左 |
+| 被取消 | 主动单余量 | 队头挂单（整单） |
+| 已成交部分 | 保留 | 保留 |
+| 对手挂单 | 不动 | 被撤销，撮合继续（可连撤） |
+| 余量 | **不挂簿**（否则簿交叉） | 不受影响（继续吃 / 可能挂簿） |
+| outcome | `Cancelled`（既有规则自动落） | 由既有规则决定 |
+| 事件 | 1 个 OrderCanceled（主动单） | 每撤一笔 1 个 OrderCanceled |
+
+**不变的 W3 部分**：校验顺序与五种原因码；预检账户盲；成交价=被动价；outcome 判定规则；`set_trade_handler` 通道。
+
+---
+
+## 完成标准、复盘与迁移练习
+
+**完成标准（逐条可检查）**
+
+- [ ] `ctest --test-dir build`：227/227 通过（151 旧 + 76 新）。
+- [ ] `scripts/run_sanitizers.sh`：227/227，无 sanitizer 报告。
+- [ ] 口试自检的 10 个问题能对着代码回答。
+- [ ] `git log` 上有一条 W4 提交。
+
+**复盘（用三句话写进笔记）**
+
+1. 本周新增的能力：____。
+2. 最反直觉的一个设计决定是 ____，理由是 ____。
+3. 我踩过的最大一个坑是 ____，它属于（正确性 / 内存 / 契约 / 构建）里的哪一类。
+
+**迁移练习（不要求写代码，想清楚即可）**
+
+1. 加第五种策略 **Decrement**（双方各自减量到"刚好不交叉"）：要改哪些函数？事件流会多出什么、会不会出现新的事件种类？簿上/在途的状态分别怎么收尾？
+2. 给 `OrderCanceled` 增加一个"取消原因"字段（外部撤单 / STP / IOC 余量）：需要动哪些地方？差分 oracle 怎么同步？契约（测试）要新增什么？
+3. 把 `Event` 从固定结构体换成 `std::variant`：`EventBus`、订阅端代码、写日志的消费者各会变成什么样？哪些现有测试要改？换来的是什么、代价是什么？
 
 ---
 
@@ -455,44 +786,46 @@ public:
     Quantity  quantity;
     Side      side;
     OrderType type = OrderType::Limit;
-    AccountId account{0}; // 0 = 未设置账户，永不触发自成交防护
+    AccountId account{0}; // 0 = 未设置账户，永不触发自成交防护（§2.2）
 };
 ```
 
-**为什么**：追加 + 默认值 + 不加构造函数，三条纪律与 W3 任务 1 相同；
-`{0}` 比省略默认值更明确——聚合初始化少写字段时走"未设置"而非未定义。
+**为什么**：追加 + 默认值 + 不加构造函数，三条纪律与 W3 任务 1 相同；`{0}` 比省略默认值更明确——聚合初始化少写字段时走"未设置"而非不确定值。
 
 ### A2 — 任务 2：matching_engine.h 增补
 
+类型定义（节选自 §1.3 / §1.6 / §2.6 的契约，逐字段照抄）：
+
 ```cpp
-// 自成交防护策略（仅当双方账户相同且非 0 时生效）。
+// 自成交防护策略（仅当双方账户相同且非 0 时生效，§2.6）。
 enum class SelfMatchPolicy : std::uint8_t {
-    CancelNewest, // 即将吃到自己账户的挂单时：主动单余量全部取消，挂单不动
-    CancelOldest, // 即将吃到自己账户的挂单时：将该挂单整单撤销，撮合继续
+    CancelNewest, // 撞上自己的挂单：主动单余量取消，挂单不动
+    CancelOldest, // 撞上自己的挂单：撤掉该挂单，撮合继续
 };
 
+// 事件种类 = 四类市场可观察事实（§1.2）。
 enum class EventKind : std::uint8_t {
-    Trade,         // 一笔成交
-    OrderRested,   // 余量挂入簿（含部分成交后的余量；全额成交不发）
-    OrderCanceled, // 簿上订单被撤 / 余量被取消（含 STP 两种策略的取消）
-    OrderRejected, // 订单被拒
+    Trade,
+    OrderRested,
+    OrderCanceled,
+    OrderRejected,
 };
 
 using SubscriptionId = std::uint64_t;
 
 // 事件。与 kind 无关的字段保持默认值（{0} / None）。
 struct Event {
-    EventKind           kind;
-    maelstrom::OrderId  order_id{0};
+    EventKind            kind;
+    maelstrom::OrderId   order_id{0};
     maelstrom::AccountId account{0};
-    maelstrom::Side     side = maelstrom::Side::Sell;
-    maelstrom::OrderId  counterparty_id{0};
-    maelstrom::Price    price{0};
-    maelstrom::Quantity quantity{0};
-    RejectReason        reason = RejectReason::None;
+    maelstrom::Side      side = maelstrom::Side::Sell;
+    maelstrom::OrderId   counterparty_id{0};
+    maelstrom::Price     price{0};
+    maelstrom::Quantity  quantity{0};
+    RejectReason         reason = RejectReason::None;
 };
 
-// 多订阅者事件总线：同步分发，按订阅注册顺序逐一回调。
+// 多订阅者事件总线：同步分发，按订阅注册顺序逐一回调（§1.4）。
 class EventBus {
 public:
     using Handler = std::function<void(const Event &)>;
@@ -534,10 +867,7 @@ private:
 
 ```cpp
 public:
-    // 切换自成交防护策略，只影响其后的 submit。
-    void set_self_match_policy(SelfMatchPolicy policy);
-
-    // 事件总线转发。W3 的 trade handler 通道与之相互独立。
+    void set_self_match_policy(SelfMatchPolicy policy);          // 只影响其后的 submit
     [[nodiscard]] SubscriptionId subscribe(EventBus::Handler handler);
     bool unsubscribe(SubscriptionId id);
 
@@ -546,103 +876,85 @@ private:
     SelfMatchPolicy policy_ = SelfMatchPolicy::CancelNewest;
 ```
 
-需要 `#include <vector>`。**为什么订阅号不复用**：调用方持有的 id 若被复用，
-退订会误伤别人——单调递增让"id 是否有效"永远无歧义。
+需要 `#include <vector>`。
 
 ### A3 — 任务 3/4：matching_engine.cpp 增量
 
-`submit()` 的增量（校验段的 reject 换成发事件的 lambda；循环插入 STP；余量段加发布）：
+以下是**增量（diff 视角）**，完整结构仍是你 W3 写的 `submit`。
 
 ```cpp
-SubmitResult MatchingEngine::submit(maelstrom::Order o) {
-    // 1) 校验（顺序不变；account 不参与校验），每个拒绝发一个 OrderRejected
-    auto reject = [&](RejectReason r) {
-        Event ev{};
-        ev.kind   = EventKind::OrderRejected;
-        ev.order_id = o.orderId;
-        ev.account  = o.account;
-        ev.side     = o.side;
-        ev.reason   = r;
-        bus_.publish(ev);
-        SubmitResult res;
-        res.outcome = OrderOutcome::Rejected;
-        res.reason  = r;
-        return res;
-    };
-    if (o.quantity.get() <= 0) return reject(RejectReason::InvalidQuantity);
-    if (book_.find(o.orderId).has_value()) return reject(RejectReason::DuplicateOrderId);
+// 1) 拒绝收口：五个校验分支全走这里（发布点 1/7）
+auto reject = [&](RejectReason r) {
+    Event ev{};
+    ev.kind     = EventKind::OrderRejected;
+    ev.order_id = o.orderId;
+    ev.account  = o.account;
+    ev.side     = o.side;
+    ev.reason   = r;
+    bus_.publish(ev);
+    SubmitResult res;
+    res.outcome = OrderOutcome::Rejected;
+    res.reason  = r;
+    return res;
+};
+if (o.quantity.get() <= 0) return reject(RejectReason::InvalidQuantity);
+if (book_.find(o.orderId).has_value()) return reject(RejectReason::DuplicateOrderId);
+// ... 价格校验与 POST-ONLY / FOK 预检同 W3（账户盲，§2.5），走 reject(...)
 
-    const bool is_market = (o.type == OrderType::Market);
-    if (!is_market && o.price.get() <= 0) return reject(RejectReason::InvalidPrice);
-    // ... POST-ONLY / FOK 预检原样保留（不看账户），走 reject(...)
-    // 注意：预检是账户盲——PostOnly 撞自己账户的最优价照样拒。
+bool self_killed = false; // STP-CN：主动单余量被砍，禁止挂簿（§2.4）
+while (remaining > 0) {
+    const auto best = (opp == Side::Sell) ? book_.best_ask() : book_.best_bid();
+    if (!best.has_value()) break;
+    if (!is_market && !crosses(o.side, o.price, best->price)) break;
 
-    std::int64_t remaining   = o.quantity.get();
-    std::int64_t filled      = 0;
-    std::size_t  trades      = 0;
-    bool         self_killed = false;
-
-    while (remaining > 0) {
-        const auto best = (opp == Side::Sell) ? book_.best_ask() : book_.best_bid();
-        if (!best.has_value()) break;
-        if (!is_market && !crosses(o.side, o.price, best->price)) break;
-
-        // STP：执行接触点判定（只看队头这一笔；双方账户相同且非 0）
-        if (o.account.get() != 0 && best->account == o.account) {
-            if (policy_ == SelfMatchPolicy::CancelNewest) {
-                Event ev{};
-                ev.kind = EventKind::OrderCanceled;
-                ev.order_id = o.orderId;  ev.account = o.account;  ev.side = o.side;
-                ev.quantity = Quantity{remaining};
-                bus_.publish(ev);
-                self_killed = true;
-                break;
-            }
-            Event ev{};
+    // STP：执行接触点判定，只看队头（§2.6）
+    if (o.account.get() != 0 && best->account == o.account) {
+        if (policy_ == SelfMatchPolicy::CancelNewest) {
+            Event ev{};                                  // 发布点 5/7
             ev.kind = EventKind::OrderCanceled;
-            ev.order_id = best->orderId;  ev.account = best->account;  ev.side = best->side;
-            ev.quantity = best->quantity;
+            ev.order_id = o.orderId; ev.account = o.account; ev.side = o.side;
+            ev.quantity = Quantity{remaining};
             bus_.publish(ev);
-            book_.cancel(best->orderId);
-            continue; // 撮合继续：同价下一笔可能又是自己的
+            self_killed = true;
+            break;
         }
-
-        // ... 原有的 take / consume_best / Trade 事件 / handler_(t) 原样保留 ...
-    }
-
-    const std::int64_t original = o.quantity.get();
-    Quantity rest{0};
-    const bool can_rest = !self_killed &&
-                          (o.type == OrderType::Limit || o.type == OrderType::PostOnly);
-    if (remaining > 0 && can_rest) {
-        Order r = o;                      // 账户随单携带
-        r.quantity = Quantity{remaining};
-        book_.add(r);
-        rest = Quantity{remaining};
-        Event ev{};
-        ev.kind = EventKind::OrderRested;
-        ev.order_id = r.orderId;  ev.account = r.account;  ev.side = r.side;
-        ev.price = r.price;  ev.quantity = rest;
-        bus_.publish(ev);
-    }
-    else if (remaining > 0 && !self_killed) {
-        // Market/IOC 余量被取消（STP-CN 的取消已在循环内发过，别发两次）
-        Event ev{};
+        Event ev{};                                      // 发布点 6/7（CO 可连发）
         ev.kind = EventKind::OrderCanceled;
-        ev.order_id = o.orderId;  ev.account = o.account;  ev.side = o.side;
-        ev.quantity = Quantity{remaining};
+        ev.order_id = best->orderId; ev.account = best->account; ev.side = best->side;
+        ev.quantity = best->quantity;
         bus_.publish(ev);
+        book_.cancel(best->orderId);
+        continue; // 不消耗 remaining；同价下一笔可能又是自己的
     }
 
-    // outcome 组装与 W3 完全相同：STP-CN 自然落 Cancelled，不需要新分支
-    // ...
+    // ... W3 原有：take / consume_best / Trade 事件（发布点 2/7）/ handler_(t)
 }
+
+const bool can_rest = !self_killed && (o.type == OrderType::Limit || o.type == OrderType::PostOnly);
+if (remaining > 0 && can_rest) {
+    Order r = o; r.quantity = Quantity{remaining};       // 账户随余量入簿（§2.6）
+    book_.add(r);
+    rest = Quantity{remaining};
+    Event ev{};                                          // 发布点 3/7
+    ev.kind = EventKind::OrderRested;
+    ev.order_id = r.orderId; ev.account = r.account; ev.side = r.side;
+    ev.price = r.price; ev.quantity = rest;
+    bus_.publish(ev);
+}
+else if (remaining > 0 && !self_killed) {
+    Event ev{};                                          // 发布点 4/7：Market/IOC 余量取消
+    ev.kind = EventKind::OrderCanceled;                  // （!self_killed 防止与 CN 重复）
+    ev.order_id = o.orderId; ev.account = o.account; ev.side = o.side;
+    ev.quantity = Quantity{remaining};
+    bus_.publish(ev);
+}
+// outcome 组装与 W3 完全相同：CN 自然落 Cancelled，不需要新分支（§2.4）
 ```
 
-`cancel()` 增量（先捕获字段，再撤，再发事件——顺序不能反）：
+`cancel()`（先捕获字段，再撤，再发事件——顺序不能反）：
 
 ```cpp
-bool MatchingEngine::cancel(OrderId id) {
+bool MatchingEngine::cancel(OrderId id) {                // 发布点 7/7
     const auto existing = book_.find(id);
     if (!existing.has_value()) return false;
     book_.cancel(id);
@@ -658,11 +970,9 @@ bool MatchingEngine::cancel(OrderId id) {
 ```
 
 **为什么**：
-- STP-CN 不需要新的 outcome 分支——W3 的规则（resting==0 且 filled<original → Cancelled）
-  自动覆盖它；你要做的只是用 `self_killed` 把余量挡在挂簿之外。
-- `else if (remaining > 0 && !self_killed)` 是 Market/IOC 的终态事件发出口；
-  `!self_killed` 防止与 STP-CN 的取消事件重复。
-- 每轮循环要么撤一笔（簿缩小）、要么吃一笔、要么 break——CancelOldest 的连撤必然终止。
+- STP-CN 不需要新的 outcome 分支——W3 的规则（`resting == 0` 且 `filled < original` → `Cancelled`）自动覆盖它；你要做的只是用 `self_killed` 把余量挡在挂簿之外（§2.4）。
+- `else if (remaining > 0 && !self_killed)` 是 Market/IOC 的终态事件出口；`!self_killed` 防止与 CN 的取消事件重复。
+- 每轮循环要么撤一笔（簿缩小）、要么吃一笔（remaining 缩小）、要么 break——CO 的连撤必然终止（§2.4）。
 
 ### A4 — 任务 5：CMake 改动
 
@@ -676,16 +986,16 @@ add_executable(maelstrom_tests
     test_matching_engine_w4.cpp)
 ```
 
-`naive_matching_engine_w4.h` 会被测试源自动 include，无需登记；库目标没有任何新增
-（W4 没有新的 .cpp / 头文件）。改完必须重新 `cmake -B build ...` 再构建。
+`naive_matching_engine_w4.h` 会被测试源自动 include，无需登记；库目标没有任何新增。
 
-### A5 — 跑差分时怎么读失败信息
+### A5 — 差分与门禁的报告怎么读
 
-差分失败信息自带现场：`seed=... step=... 事件数不一致 fast=... slow=... policy=... type=... side=... acct=...`。
-- `policy=0` 是 CancelNewest、`policy=1` 是 CancelOldest——先看策略是不是只红一类；
-- 事件数一致但内容不一致时，信息里给 `fast_kind` / `slow_kind`（枚举值：0=Trade、
-  1=OrderRested、2=OrderCanceled、3=OrderRejected）；
-- 把 seed/step 记下来，在两边各加一段打印（或写个小 main 重放前 step+1 步）即可二分定位。
+- 差分失败信息自带现场：`seed=... step=... policy=... type=... side=... acct=...`；
+  事件不一致时还给 `第 k 个事件` 与双方 `kind`（0=Trade、1=OrderRested、2=OrderCanceled、3=OrderRejected）。
+- `policy=0` 是 CancelNewest、`policy=1` 是 CancelOldest——先看"是不是只红一类策略"。
+- 把 seed/step 记下来，写个小 main 重放前 step+1 步（RNG 消费顺序照抄测试）即可二分定位到具体操作。
+- 门禁报 `heap-use-after-free`：优先查 `cancel()` 的"先捕获后删"顺序与发布点时序；
+  报 `leaked`：优先查 subscribe 了没退订、`Order` 复制路径有没有裸资源。
 
 ---
 
@@ -696,11 +1006,30 @@ add_executable(maelstrom_tests
   W3 全量回归、事件流参与随机差分、内存/UB 门禁。
 - **不做（留给后续）**：
   - 分发期间订阅/退订、多线程分发与并发安全 → W5（无锁队列 + 线程隔离）；
-  - 更多 STP 策略（Decrement / RejectIncoming / CancelBoth）→ 简历扩展模块；
-  - `std::variant` 事件、事件持久化/回放、订阅优先级 → 扩展模块；
-  - 订单改价触发重撮合 → W4 思考题（提示：改价 = 撤单事件 + 新挂单事件？）；
+  - 更多 STP 策略（Decrement / RejectIncoming / CancelBoth）→ 扩展模块（迁移练习 1）；
+  - `std::variant` 事件、事件持久化/回放、订阅优先级 → 扩展模块（迁移练习 3）；
+  - 订单改价触发重撮合（提示：改价 = 撤单事件 + 新挂单事件？）；
   - 低延迟分发（内联小函数、静态多播）→ W6/W7。
 
-> 一句话记住 W4 的定位：**W3 的引擎只对调用者负责，W4 的引擎对市场负责——
-> 每一件发生的事都如实广播（EventBus），每一件不该发生的事都被拦下（STP），
-> 而这一切在 40 个随机种子的对拍下与参考实现逐字节一致。**
+> 一句话记住 W4 的定位：**W3 的引擎只对调用者负责；W4 的引擎对市场负责——
+> 发生的每件事都广播给所有关心的人（EventBus），不该发生的事当场拦下（STP），
+> 而这一切在 40 个随机种子下与参考实现逐字节一致。**
+
+---
+
+## 参考资料
+
+阅读目的已标注；按需读，不必通读。
+
+- cppreference：`std::function`（https://en.cppreference.com/w/cpp/utility/functional/function）——
+  订阅回调的存储载体；重点看"空对象调用未定义/抛出"，理解我们"未设置 handler 时先判空"的写法。
+- cppreference：`std::variant`（https://en.cppreference.com/w/cpp/utility/variant）——
+  §1.3 讨论过的替代事件表示；读 `std::visit` 部分，做迁移练习 3 时对照。
+- cppreference：`std::optional`（https://en.cppreference.com/w/cpp/utility/optional）——
+  §2.2 讨论过的账户表示替代方案。
+- cppreference：aggregate initialization（https://en.cppreference.com/w/cpp/language/aggregate_initialization）——
+  "为什么追加字段 + 默认值不破坏旧初始化"的规则出处（C++17 口径）。
+- 交易所 STP 机制：在 Nasdaq / CME 官网搜索 "Self-Match Prevention"——
+  行业做法与策略空间（§2.3 的五种策略即由此归纳），作为领域背景阅读，不要求实现。
+- 《Trading and Exchanges》— Larry Harris（PROJECT_PLAN 已列）——
+  自成交/洗售在市场微观结构里的定位（§0.3 的领域动机）。

@@ -8,7 +8,7 @@ using namespace maelstrom;
 namespace matching_engine {
 
 void MatchingEngine::set_trade_handler(TradeHandler trade) {
-    handler_ = trade;
+    handler_ = std::move(trade);
 }
 
 const OrderBook &MatchingEngine::book() const noexcept {

@@ -1,16 +1,53 @@
 ---
+# ── 检查清单：只保留"能指出真问题"的检查 ────────────────────────────────
+# 保留（性能 / 资源 / 未定义行为 / 安全编码）：
+#   bugprone-*           常见 bug 模式：未检查的 optional、use-after-move、
+#                        悬垂句柄、整数溢出、易传反参数…
+#   performance-*        时间与空间开销：循环内拷贝、临时对象、endl 刷缓冲、
+#                        枚举底层类型过大…
+#   cert-*               安全编码规则：未检查返回值、有符号溢出、格式串、
+#                        静态初始化抛异常、不可预测随机数…
+#   cppcoreguidelines-*  仅保留 13 条语义子集（见下方列表）：未初始化、
+#                        所有权、类型系统逃逸、移动语义、切片
+#   readability-*        仅保留 4 条"看起来对、实际错"的检查（见下方列表）
+#   modernize-use-emplace  避免"先构造临时对象再拷贝"
+#
+# 关闭（纯风格 / 命名 / 复杂度 / 现代化偏好，不指向任何性能或 UB 问题）：
+#   readability-* 其余全部（含 function-cognitive-complexity、
+#   uppercase-literal-suffix、braces-around-statements…）；
+#   modernize-* 其余全部；cppcoreguidelines 的"应该用 gsl / 应该这样写"子集；
+#   cert-dcl16-c（字面量后缀大小写，与 readability 同款检查重复）
+#
+# 以后嫌哪条吵：在下方列表里加一行「-检查名,」即可（注意逗号）。
+#
+# ⚠️ 维护警告：下方 Checks 是 YAML 折叠标量（>），块内的 '#' 不是注释。
+#    列表内每一行都必须以"半角逗号"结尾——注释行也不例外！
+#    漏掉一个逗号会把下一行的检查名并进前一个 token，导致启用/禁用
+#    静默失效，且 clang-tidy 不报任何错。要写说明一律写在这里（键外）。
 Checks: >
     -*,
     bugprone-*,
-    modernize-*,
     performance-*,
-    readability-*,
     cert-*,
-    cppcoreguidelines-*,
-    -modernize-use-trailing-return-type,
-    -readability-identifier-length,
-    -cppcoreguidelines-avoid-magic-numbers,
-    -readability-magic-numbers
+    -cert-dcl16-c,
+    cppcoreguidelines-init-variables,
+    cppcoreguidelines-no-malloc,
+    cppcoreguidelines-owning-memory,
+    cppcoreguidelines-pro-type-member-init,
+    cppcoreguidelines-pro-type-const-cast,
+    cppcoreguidelines-pro-type-reinterpret-cast,
+    cppcoreguidelines-pro-type-union-access,
+    cppcoreguidelines-pro-type-vararg,
+    cppcoreguidelines-rvalue-reference-param-not-moved,
+    cppcoreguidelines-slicing,
+    cppcoreguidelines-virtual-class-destructor,
+    cppcoreguidelines-missing-std-forward,
+    cppcoreguidelines-misleading-capture-default-by-value,
+    readability-suspicious-call-argument,
+    readability-misleading-indentation,
+    readability-reference-to-constructed-temporary,
+    readability-uniqueptr-delete-release,
+    modernize-use-emplace,
 WarningsAsErrors: ''
 HeaderFilterRegex: '.*'
 FormatStyle: file

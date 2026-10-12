@@ -1,4 +1,7 @@
 include(FetchContent)
+
+set(CMAKE_CXX_CLANG_TIDY "")
+
 FetchContent_Declare(
     googletest
     GIT_REPOSITORY https://github.com/google/googletest.git

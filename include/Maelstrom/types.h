@@ -22,9 +22,13 @@ struct StrongType { // 强类型，防止类型传递混乱
 struct PriceTag {};
 struct QuantityTag {};
 struct OrderIdTag {};
+struct AccountIdTag {};
+struct SubscriptionIdTag {};
 
-using Price    = StrongType<PriceTag, std::int64_t>;
-using Quantity = StrongType<QuantityTag, std::int64_t>;
-using OrderId  = StrongType<OrderIdTag, std::int64_t>;
+using Price          = StrongType<PriceTag, std::int64_t>;
+using Quantity       = StrongType<QuantityTag, std::int64_t>;
+using OrderId        = StrongType<OrderIdTag, std::int64_t>;
+using AccountId      = StrongType<AccountIdTag, std::int64_t>;
+using SubscriptionId = StrongType<SubscriptionIdTag, std::int64_t>;
 
 } // namespace maelstrom

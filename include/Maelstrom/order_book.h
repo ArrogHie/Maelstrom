@@ -45,7 +45,7 @@ private:
     struct OrderIdHash;
     std::unique_ptr<Impl> impl;
 
-    bool check_order(const Order &o) const;
+    [[nodiscard]] bool check_order(const Order &o) const;
 };
 
 } // namespace maelstrom
