@@ -4,6 +4,8 @@
 // (oracle)，契约与 docs/W4_MATCHING_GUIDE.md 的"判据"逐条一致。在 W3 oracle 的
 // 直白风格（vector + 全扫）上增加：
 //   - Order.account 与自成交防护（CancelNewest / CancelOldest，执行接触点判定）
+//   - FOK 的 STP 感知全额成交预检（在副本上干跑：CN 撞上自己即失败，
+//     CO 撤掉自己继续；失败 = 零副作用；FOK 永不部分成交、永不挂簿）
 //   - 事件流记录（events()：Trade / OrderRested / OrderCanceled / OrderRejected）
 // 差分测试喂相同 submit/cancel 序列，逐步比对 SubmitResult / 事件流 / 簿状态。
 #pragma once
@@ -38,7 +40,7 @@ public:
 
         const Side opp = (o.side == Side::Buy) ? Side::Sell : Side::Buy;
 
-        // 预检只看价格，不看账户（与判据一致）。
+        // POST-ONLY 预检只看价格，不看账户（与判据一致：拒单是安全方向）。
         if (o.type == OrderType::PostOnly) {
             const int best = best_index(opp, std::nullopt, o.side);
             if (best >= 0 &&
@@ -47,15 +49,40 @@ public:
             }
         }
 
+        // FOK 预检：STP 感知的"可达流动性"——在副本上干跑一次撮合（纯读、零副作用）。
+        // CN：撞上自己的挂单即失败（余量会被 STP 砍掉，无法全额成交）；
+        // CO：撤掉自己的挂单继续；失败时真实簿不得有任何变化。
         if (o.type == OrderType::Fok) {
-            std::int64_t avail = 0;
-            for (const Entry &e : rest_) {
-                if (e.order.side != opp) continue;
-                if (is_market || crosses(o.side, o.price, e.order.price)) {
-                    avail += e.order.quantity.get();
+            std::vector<Entry>         sim = rest_;
+            const std::optional<Price> flimit =
+                is_market ? std::nullopt : std::optional<Price>{o.price};
+            std::int64_t remaining = o.quantity.get();
+            bool         fillable  = true;
+            while (remaining > 0) {
+                const int bi = best_index_in(sim, opp, flimit, o.side);
+                if (bi < 0) {
+                    fillable = false;
+                    break;
+                }
+                const std::size_t si = static_cast<std::size_t>(bi);
+                if (o.account.get() != 0 && sim[si].order.account == o.account) {
+                    if (policy_ == SelfMatchPolicy::CancelNewest) {
+                        fillable = false;
+                        break;
+                    }
+                    sim.erase(sim.begin() + bi);
+                    continue;
+                }
+                const std::int64_t take = std::min(remaining, sim[si].order.quantity.get());
+                remaining -= take;
+                if (take >= sim[si].order.quantity.get()) {
+                    sim.erase(sim.begin() + bi);
+                }
+                else {
+                    sim[si].order.quantity = Quantity{sim[si].order.quantity.get() - take};
                 }
             }
-            if (avail < o.quantity.get()) return rejected(o, RejectReason::FokNotFillable);
+            if (!fillable) return rejected(o, RejectReason::FokNotFillable);
         }
 
         std::int64_t remaining  = o.quantity.get();
@@ -218,17 +245,19 @@ private:
         return -1;
     }
 
-    [[nodiscard]] int best_index(Side side, std::optional<Price> limit, Side aggressor) const {
+    // 在任意挂单集合 v 上找 价格最优 + seq 最小 的下标（供 FOK 预检的副本干跑复用）。
+    static int best_index_in(const std::vector<Entry> &v, Side side, std::optional<Price> limit,
+                             Side aggressor) {
         int best = -1;
-        for (std::size_t i = 0; i < rest_.size(); ++i) {
-            const Entry &e = rest_[i];
+        for (std::size_t i = 0; i < v.size(); ++i) {
+            const Entry &e = v[i];
             if (e.order.side != side) continue;
             if (limit.has_value() && !crosses(aggressor, *limit, e.order.price)) continue;
             if (best < 0) {
                 best = static_cast<int>(i);
                 continue;
             }
-            const Entry &b      = rest_[static_cast<std::size_t>(best)];
+            const Entry &b      = v[static_cast<std::size_t>(best)];
             const bool   better = (side == Side::Sell) ? (e.order.price < b.order.price)
                                                        : (e.order.price > b.order.price);
             if (better || (e.order.price == b.order.price && e.seq < b.seq)) {
@@ -236,6 +265,10 @@ private:
             }
         }
         return best;
+    }
+
+    [[nodiscard]] int best_index(Side side, std::optional<Price> limit, Side aggressor) const {
+        return best_index_in(rest_, side, limit, aggressor);
     }
 
     [[nodiscard]] std::optional<Order> best_of(Side side) const {

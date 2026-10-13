@@ -1,16 +1,18 @@
 // W4 验收测试（AI 隔离编写，只作为正确性裁判）。
 //
-// 内容分四部分：
+// 内容分五部分：
 //   1. MatchingW4.*            确定性单元测试：账户与自成交防护（两种策略）/
-//                              引擎事件流 / 大数量边界 / 策略切换。
+//                              FOK×STP（可达流动性预检）/ 引擎事件流 /
+//                              大数量边界 / 策略切换。
 //   2. MatchingW4.Lifetime*    生命周期与内存/UB 压力：账户+STP+订阅churn，
 //                              配合 ASan/LSan/UBSan 抓 use-after-free / 泄漏。
 //   3. EventBusW4.*            事件总线直接验收：注册顺序 / 退订 / 订阅号。
-//   4. Seeds/MatchingDifferentialW4.*  随机差分对拍：真实引擎 vs NaiveMatchingEngineW4，
+//   4. BookPrimitivesW4.*      簿原语验收：改价保留 account/type。
+//   5. Seeds/MatchingDifferentialW4.*  随机差分对拍：真实引擎 vs NaiveMatchingEngineW4，
 //                              逐步比对 SubmitResult / 完整事件流 / 簿状态。
 //
-// 事件捕获（BusCap::got）跨操作累积：垫单之后统一用 tail(got, n) 断言“本次操作之后”。
-// 语义契约见 docs/W4_MATCHING_GUIDE.md 的“判据”一节，两者必须逐字一致。
+// 事件捕获（BusCap::got）跨操作累积：垫单之后统一用 tail(got, n) 断言”本次操作之后”。
+// 语义契约见 docs/W4_MATCHING_GUIDE.md 的”判据”一节，两者必须逐字一致。
 #include <cstdint>
 #include <gtest/gtest.h>
 #include <optional>
@@ -250,17 +252,133 @@ TEST(MatchingW4, StpCancelNewestWithMarketOrder) {
                   {ev_trade(3, 7, Side::Buy, 1, 100, 3), ev_canceled(3, 7, Side::Buy, 7)});
 }
 
-TEST(MatchingW4, StpFokPrecheckBlindThenCancelledByNewest) {
-    BusCap c;
+// —— FOK × STP：FOK 的"全额成交"承诺不可被 STP 打破（判据 §2.5）——
+// 预检按【当前策略下的可达流动性】判定：CN 撞上自己的挂单即不可全额成交；
+// CO 撤掉自己的挂单继续；失败的 FOK 零副作用（不成交、不撤 Maker、簿不变）。
+
+TEST(MatchingW4, FokCancelNewestRejectsWhenSelfBlocks) {
+    BusCap c; // 默认 CancelNewest
     ASSERT_TRUE(c.eng.submit(mk(1, 100, 3, Side::Sell, OrderType::Limit, 1)).accepted());
     ASSERT_TRUE(c.eng.submit(mk(2, 100, 5, Side::Sell, OrderType::Limit, 7)).accepted());
     const std::size_t n = c.got.size();
 
-    // FOK 预检不看账户：matchable=8 >= 8 通过；执行时撞上自己的 5 手 -> 部分成交后取消
+    // 总量 8 够，但吃到自己的 5 手前只凑到 3 —— CN 下余量必被砍 -> 整体拒绝
     SubmitResult r = c.eng.submit(mk(3, 101, 8, Side::Buy, OrderType::Fok, 7));
-    expect_result(r, OrderOutcome::Cancelled, Quantity{3}, Quantity{0}, 1);
+    expect_result(r, OrderOutcome::Rejected, Quantity{0}, Quantity{0}, 0,
+                  RejectReason::FokNotFillable);
+    expect_order(c.eng.book().best_ask(), 1, 100, 3, Side::Sell); // 两笔挂单原样
+    EXPECT_EQ(c.eng.book().size(), 2u);
+    expect_events(tail(c.got, n), {ev_rejected(3, 7, Side::Buy, RejectReason::FokNotFillable)});
+}
+
+TEST(MatchingW4, FokCancelNewestRejectsWhenOwnAtBetterPrice) {
+    BusCap c; // 默认 CancelNewest
+    ASSERT_TRUE(c.eng.submit(mk(1, 99, 5, Side::Sell, OrderType::Limit, 7)).accepted());
+    ASSERT_TRUE(c.eng.submit(mk(2, 100, 6, Side::Sell, OrderType::Limit, 1)).accepted());
+    const std::size_t n = c.got.size();
+
+    // 自己的挂单价格更优（第一个就撞上）：可达流动性为 0 -> 整体拒绝
+    SubmitResult r = c.eng.submit(mk(3, 100, 6, Side::Buy, OrderType::Fok, 7));
+    expect_result(r, OrderOutcome::Rejected, Quantity{0}, Quantity{0}, 0,
+                  RejectReason::FokNotFillable);
+    EXPECT_EQ(c.eng.book().size(), 2u);
+    expect_events(tail(c.got, n), {ev_rejected(3, 7, Side::Buy, RejectReason::FokNotFillable)});
+}
+
+TEST(MatchingW4, FokCancelOldestSkipsOwnAndFills) {
+    BusCap c;
+    c.eng.set_self_match_policy(SelfMatchPolicy::CancelOldest);
+    ASSERT_TRUE(c.eng.submit(mk(1, 99, 4, Side::Sell, OrderType::Limit, 1)).accepted());
+    ASSERT_TRUE(c.eng.submit(mk(2, 99, 3, Side::Sell, OrderType::Limit, 7)).accepted());
+    ASSERT_TRUE(c.eng.submit(mk(3, 100, 6, Side::Sell, OrderType::Limit, 2)).accepted());
+    const std::size_t n = c.got.size();
+
+    // 跳过自己后别人有 4+6=10 -> 全额成交：吃 4、撤自己、吃 6
+    SubmitResult r = c.eng.submit(mk(4, 100, 10, Side::Buy, OrderType::Fok, 7));
+    expect_result(r, OrderOutcome::Filled, Quantity{10}, Quantity{0}, 2);
+    EXPECT_EQ(c.eng.book().size(), 0u);
+    expect_events(tail(c.got, n), {ev_trade(4, 7, Side::Buy, 1, 99, 4),
+                                   ev_canceled(2, 7, Side::Sell, 3),
+                                   ev_trade(4, 7, Side::Buy, 3, 100, 6)});
+}
+
+TEST(MatchingW4, FokCancelOldestRejectsWhenReachInsufficient) {
+    BusCap c;
+    c.eng.set_self_match_policy(SelfMatchPolicy::CancelOldest);
+    ASSERT_TRUE(c.eng.submit(mk(1, 99, 4, Side::Sell, OrderType::Limit, 1)).accepted());
+    ASSERT_TRUE(c.eng.submit(mk(2, 99, 3, Side::Sell, OrderType::Limit, 7)).accepted());
+    ASSERT_TRUE(c.eng.submit(mk(3, 100, 5, Side::Sell, OrderType::Limit, 2)).accepted());
+    const std::size_t n = c.got.size();
+
+    // 跳过自己后只有 4+5=9 < 10 -> 整体拒绝；预检是只读的，自己的挂单不得被撤
+    SubmitResult r = c.eng.submit(mk(4, 100, 10, Side::Buy, OrderType::Fok, 7));
+    expect_result(r, OrderOutcome::Rejected, Quantity{0}, Quantity{0}, 0,
+                  RejectReason::FokNotFillable);
+    EXPECT_EQ(c.eng.book().size(), 3u); // 三笔全在
+    EXPECT_EQ(c.eng.book().find(OID(2)).has_value(), true);
+    expect_events(tail(c.got, n), {ev_rejected(4, 7, Side::Buy, RejectReason::FokNotFillable)});
+}
+
+TEST(MatchingW4, FokCancelOldestCancelsBetterPricedOwnFirst) {
+    BusCap c;
+    c.eng.set_self_match_policy(SelfMatchPolicy::CancelOldest);
+    ASSERT_TRUE(c.eng.submit(mk(1, 99, 5, Side::Sell, OrderType::Limit, 7)).accepted());
+    ASSERT_TRUE(c.eng.submit(mk(2, 100, 6, Side::Sell, OrderType::Limit, 1)).accepted());
+    const std::size_t n = c.got.size();
+
+    // 自己的挂单价格更优：CO 下先撤掉它，再吃别人的 6
+    SubmitResult r = c.eng.submit(mk(3, 100, 6, Side::Buy, OrderType::Fok, 7));
+    expect_result(r, OrderOutcome::Filled, Quantity{6}, Quantity{0}, 1);
+    EXPECT_EQ(c.eng.book().size(), 0u);
     expect_events(tail(c.got, n),
-                  {ev_trade(3, 7, Side::Buy, 1, 100, 3), ev_canceled(3, 7, Side::Buy, 5)});
+                  {ev_canceled(1, 7, Side::Sell, 5), ev_trade(3, 7, Side::Buy, 2, 100, 6)});
+}
+
+TEST(MatchingW4, FokFillsBeforeContactingOwnBothPolicies) {
+    // 前面的别人就够成交：两种策略下都全额成交，自己的挂单不被动（STP 遵守实际撮合顺序）
+    for (SelfMatchPolicy policy : {SelfMatchPolicy::CancelNewest, SelfMatchPolicy::CancelOldest}) {
+        BusCap c;
+        c.eng.set_self_match_policy(policy);
+        ASSERT_TRUE(c.eng.submit(mk(1, 100, 5, Side::Sell, OrderType::Limit, 1)).accepted());
+        ASSERT_TRUE(c.eng.submit(mk(2, 100, 3, Side::Sell, OrderType::Limit, 7)).accepted());
+        const std::size_t n = c.got.size();
+
+        SubmitResult r = c.eng.submit(mk(3, 100, 5, Side::Buy, OrderType::Fok, 7));
+        expect_result(r, OrderOutcome::Filled, Quantity{5}, Quantity{0}, 1);
+        expect_order(c.eng.book().best_ask(), 2, 100, 3, Side::Sell); // 自己的挂单原样
+        EXPECT_EQ(c.eng.book().size(), 1u);
+        expect_events(tail(c.got, n), {ev_trade(3, 7, Side::Buy, 1, 100, 5)});
+    }
+}
+
+TEST(MatchingW4, FokIgnoresOwnOrdersOutsideLimit) {
+    BusCap c; // 默认 CancelNewest
+    ASSERT_TRUE(c.eng.submit(mk(1, 100, 3, Side::Sell, OrderType::Limit, 1)).accepted());
+    ASSERT_TRUE(c.eng.submit(mk(2, 105, 4, Side::Sell, OrderType::Limit, 7)).accepted());
+    const std::size_t n = c.got.size();
+
+    // 自己的挂单在限价 101 之外：不进入预检视野，也不阻止 FOK
+    SubmitResult r = c.eng.submit(mk(3, 101, 3, Side::Buy, OrderType::Fok, 7));
+    expect_result(r, OrderOutcome::Filled, Quantity{3}, Quantity{0}, 1);
+    expect_order(c.eng.book().best_ask(), 2, 105, 4, Side::Sell);
+    expect_events(tail(c.got, n), {ev_trade(3, 7, Side::Buy, 1, 100, 3)});
+}
+
+TEST(MatchingW4, FokAnonymousAccountsBehaveLikeW3) {
+    // 双方账户都为 0：永不触发 STP，两种策略下 FOK 行为与 W3 一致
+    for (SelfMatchPolicy policy : {SelfMatchPolicy::CancelNewest, SelfMatchPolicy::CancelOldest}) {
+        BusCap c;
+        c.eng.set_self_match_policy(policy);
+        ASSERT_TRUE(c.eng.submit(mk(1, 100, 3, Side::Sell, OrderType::Limit, 0)).accepted());
+        ASSERT_TRUE(c.eng.submit(mk(2, 100, 5, Side::Sell, OrderType::Limit, 0)).accepted());
+        const std::size_t n = c.got.size();
+
+        SubmitResult r = c.eng.submit(mk(3, 100, 8, Side::Buy, OrderType::Fok, 0));
+        expect_result(r, OrderOutcome::Filled, Quantity{8}, Quantity{0}, 2);
+        EXPECT_EQ(c.eng.book().size(), 0u);
+        expect_events(tail(c.got, n), {ev_trade(3, 0, Side::Buy, 1, 100, 3),
+                                       ev_trade(3, 0, Side::Buy, 2, 100, 5)});
+    }
 }
 
 TEST(MatchingW4, StpPostOnlyPrecheckBlindToAccount) {
@@ -268,7 +386,8 @@ TEST(MatchingW4, StpPostOnlyPrecheckBlindToAccount) {
     ASSERT_TRUE(c.eng.submit(mk(1, 100, 5, Side::Sell, OrderType::Limit, 7)).accepted());
     const std::size_t n = c.got.size();
 
-    // 即便是自己账户的挂单，POST-ONLY 预检照样按交叉拒绝（预检不知道 STP）
+    // POST-ONLY 预检保持纯价格口径（拒单是安全方向，见判据 §2.5）：
+    // 即便是自己账户的挂单，也照 PostOnlyWouldCross 拒绝
     SubmitResult r = c.eng.submit(mk(2, 100, 5, Side::Buy, OrderType::PostOnly, 7));
     expect_result(r, OrderOutcome::Rejected, Quantity{0}, Quantity{0}, 0,
                   RejectReason::PostOnlyWouldCross);
@@ -673,6 +792,34 @@ TEST(EventBusW4, EventDefaultsAreZeroed) {
     EXPECT_EQ(ev.price.get(), 0);
     EXPECT_EQ(ev.quantity.get(), 0);
     EXPECT_EQ(ev.reason, RejectReason::None);
+}
+
+// ===========================================================================
+// 5.5 簿原语：改价保留账户与类型（否则该单从此不受 STP 保护）
+// ===========================================================================
+
+TEST(BookPrimitivesW4, ModifyKeepsAccountAndType) {
+    OrderBook book;
+    ASSERT_TRUE(book.add(mk(1, 100, 5, Side::Buy, OrderType::PostOnly, 7)));
+
+    // 改价 = 摘链 + 重挂（时间优先级重排）：account / type 必须原样保留。
+    // 若实现用 Order{price, id, qty, side} 重新构造，账户会退回 0——
+    // 同一个订单改价前后拥有不同的 STP 行为。
+    ASSERT_TRUE(book.modify(OID(1), Price{99}, Quantity{5}));
+    auto a = book.find(OID(1));
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->price.get(), 99);
+    EXPECT_EQ(a->quantity.get(), 5);
+    EXPECT_EQ(a->account.get(), 7);
+    EXPECT_EQ(a->type, OrderType::PostOnly);
+
+    // 只改量同理
+    ASSERT_TRUE(book.modify(OID(1), Quantity{3}));
+    auto b = book.find(OID(1));
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(b->quantity.get(), 3);
+    EXPECT_EQ(b->account.get(), 7);
+    EXPECT_EQ(b->type, OrderType::PostOnly);
 }
 
 // ===========================================================================

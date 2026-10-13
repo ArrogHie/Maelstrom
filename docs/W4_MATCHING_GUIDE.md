@@ -11,10 +11,14 @@
 > 先到文末 **「契约速查」** 对照定位（那里是速查表，不是学习材料），再回 §1/§2 看它为什么长这样。
 >
 > 规则重申：所有实现代码由你手写进 `include/` 和 `src/`。`tests/` 里已备好**裁判测试**
-> （AI 隔离编写，只做验收、不进你的实现目录）：W4 共 76 个用例——
-> 语义单测 25 + 生命周期压力 3（`MatchingW4.*`）、总线单测 8（`EventBusW4.*`）、
-> 40 组随机差分 `Seeds/MatchingDifferentialW4.*`（你的引擎 vs 带账户与 STP 的慢速参考引擎，
-> 逐步比对 SubmitResult / **完整事件流** / 簿状态）。
+> （AI 隔离编写，只做验收、不进你的实现目录）：W4 共 84 个用例——
+> 语义单测 32 + 生命周期压力 3（`MatchingW4.*`）、簿原语 1（`BookPrimitivesW4.*`）、
+> 总线单测 8（`EventBusW4.*`）、40 组随机差分 `Seeds/MatchingDifferentialW4.*`
+> （你的引擎 vs 带账户与 STP 的慢速参考引擎，逐步比对 SubmitResult / **完整事件流** / 簿状态）。
+>
+> **本版修订（FOK × STP）**：初版契约允许 CancelNewest 下的 FOK 被 STP 砍成"部分成交"，
+> 违反 FOK 全成或全不成的语义。本版改为 **FOK 预检按"当前策略下的可达流动性"判定**：
+> 通过预检 ⇔ 必然全额成交；否则整体拒绝、对簿零副作用（§2.5 有完整推导与例子）。
 >
 > **回归铁律：W1–W3 的 151 个测试必须保持全绿。** 本周你在给一台正在运转的引擎追加字段和
 > 逻辑，旧测试是你唯一的安全网——"新功能绿了但旧的红了"不算任何进展。
@@ -64,7 +68,8 @@ bool cancel(OrderId id);              // 撤单，只回一个 bool
 
 1. **多播可用**：任意多个观察者可以订阅/退订引擎事件；能收到成交、挂簿、取消、拒绝四类事实；字段完整、顺序确定、同步送达。
 2. **STP 生效**：同一账户（非 0）的主动单不会与自己的挂单成交；两种策略（CancelNewest / CancelOldest）逐条符合契约；`account == 0` 的订单行为与 W3 **逐字节一致**。
-3. **回归与门禁**：W1–W3 的 151 个测试不改一行仍全绿；W4 新增 76 个全绿；ASan/UBSan/LSan 下 227 个全绿。
+3. **FOK 的承诺不被打破**：任何策略下，FOK 要么全额成交、要么整体拒绝（按"可达流动性"预检，§2.5）；永不部分成交、永不挂簿；失败时对簿零副作用。
+4. **回归与门禁**：W1–W3 的 151 个测试不改一行仍全绿；W4 新增 84 个全绿；ASan/UBSan/LSan 下 235 个全绿。
 
 范围边界（明确不做）：Decrement / RejectIncoming 等更多 STP 策略、异步分发与多线程（W5）、事件持久化/回放、`std::variant` 版事件。这些都留到扩展模块，理由在 §2.3 和 §1.3 里各自说明。
 
@@ -346,19 +351,59 @@ CO 的每次循环迭代只有三种可能：撤掉一笔挂单（簿严格缩�
 
 **顺带一个漂亮的性质：outcome 不需要任何新规则。** 看 CN 的结局——`resting == 0`、`filled < quantity`——W3 的 outcome 规则表自动把它分类为 `Cancelled`；CO 的结局可能落在 `Filled / PartiallyFilled / Rested / Cancelled` 里的任何一个，也全部由既有规则决定。你的工作只是**正确维护状态**（余量去哪、簿怎么变），结果分类自己就对了。这是契约扩展时值得体会的信号：**如果需要给 outcome 加新值，往往说明状态维护出了偏差**。
 
-### 2.5 预检的"账户盲区"：一个被刻意保留的语义缝
+### 2.5 FOK 与预检：全额成交的承诺不可被 STP 打破
 
-W3 的两个预检（POST-ONLY 的交叉预判、FOK 的 `matchable_quantity`）现在面临一个新问题：它们要不要也看账户、把"自己人的挂单"从可成交量里剔除？我们的决定是**不看**，理由两条：
+本节是 W4 里**最重要的一处设计修正**，值得慢慢读。
 
-- **成本**：`matchable_quantity` 现在按价位累加档量（O(档位数)）。要看账户就得按账户聚合对手侧可成交量——簿上没有按账户的索引，最坏退化成 O(挂单数)。热路径预检为了一个边角语义付出这个代价不划算。
-- **语义**：FOK 的含义应该保持"市场里有没有这么多流动性"这一纯价格问题；"这些流动性里哪些不能碰"是主体问题。把两个机制揉进同一个判定，FOK 的拒绝原因就不再纯粹，两个模块也无法各自独立测试。
+初版契约让 FOK 的预检对账户失明：`matchable_quantity` 把"自己人的挂单"也计入可成交量，执行时撞上自己再交给 STP 处理。这会产出一个**违反 FOK 语义**的结果，具体走一遍：
 
-决定带来两个必须写进契约、并被测试钉死的后果：
+```
+簿上：acct1 卖 3@100（前）、acct7 卖 5@100（后）
+acct7 提交 FOK 买 8 @101
+初版预检：matchable_quantity = 8 ≥ 8 -> 放行
+初版执行：吃掉 acct1 的 3 手，撞上自己的 5 手 -> CN 砍掉余量
+结局：部分成交 3 手后被取消 —— 一个"部分成交的 FOK"
+```
 
-1. **FOK 可以通过预检、执行时被 STP 砍成部分成交 + `Cancelled`。** 具体：簿上 acct1 卖 3@100、acct7 卖 5@100，acct7 的 FOK 买 8@101——`matchable_quantity` 数出 8 ≥ 8，预检放行；执行时吃掉 acct1 的 3 手，撞上自己的 5 手，余量被砍。结局 `Cancelled, filled=3`（`StpFokPrecheckBlindThenCancelledByNewest`）。**看见它别当 bug 报——它是契约。**
-2. **POST-ONLY 撞上自己账户的最优价，照样按 `PostOnlyWouldCross` 拒绝**（`StpPostOnlyPrecheckBlindToAccount`）——"会不会取走流动性"用的也是价格口径。
+FOK 的定义就是"无法立即全部成交则不成交"（全成或全不成）——部分成交的 FOK 在真实市场上不存在。这不是"为了少扫一次簿的简化"，而是**把违约行为写进了契约**：先承诺"要么全成"，再在执行阶段自己把承诺打折。同类漏洞在 `CancelOldest` 下也存在：初版预检计数包含了自己的挂单，而自己的挂单在执行时只会被**撤掉**、从不提供成交——"预检通过、执行时流动性耗尽"同样产出部分成交的 FOK。
 
-替代方案（把 STP 折进预检）是可行的，但要付两笔代价：簿要维护按账户的可成交量聚合（数据结构改造），且 FOK/STP 的联合语义要重新定义（"被 STP 挡住"算不算"not fillable"？拒绝还是降级成交？真实交易所两种口径都有）。这作为扩展思考留给你，不要求本周实现。
+修正后的原则三句话（本版契约）：
+
+1. **FOK 的全额成交约束不可放宽**——订单语义的正确性优先于任何实现上的便利；
+2. **STP 决定"可达流动性"**——预检必须按"当前策略下真正能吃到多少"判定，而不是"簿上有多少"；
+3. **失败的 FOK 不修改订单簿**——预检是纯读操作：不成交、不撤 Maker、簿不变。
+
+**可达流动性（reachable liquidity）的定义，逐策略**：
+
+| 策略 | 可达流动性 | 为什么 |
+|---|---|---|
+| `CancelNewest` | 按价格时间优先遍历限价内挂单，累计**他人**量，**遇到第一笔自己的挂单即停止** | 一撞上自己，余量就会被砍——后面的挂单永远碰不到 |
+| `CancelOldest` | 限价内**全部他人**量（遇到自己的挂单跳过、继续累计；凑够即停） | 自己的挂单会被撤掉，既不提供成交也不阻塞 |
+
+预检通过（可达量 ≥ 需求量）才进入撮合循环；否则 `Rejected{FokNotFillable}`，零副作用（一条 `OrderRejected` 事件之外什么都没有）。
+
+**一个例子走两遍**（测试原样钉住的场景）：acct7 提交 FOK 买 10@100，卖盘按价格时间优先为 M1(acct1, 99, 4)、M2(acct7, 99, 3)、M3(acct2, 100, 6)：
+
+| 策略 | 预检 | 结果 |
+|---|---|---|
+| `CancelNewest` | 累计 M1 得 4，撞上 M2（自己的）即停：4 < 10 | **整体拒绝**；三笔 Maker 原样，簿不变 |
+| `CancelOldest` | 跳过 M2，累计 4 + 6 = 10 ≥ 10 | **全额成交**：M1 成交 4 → M2 被撤（发取消事件）→ M3 成交 6 |
+
+把 M3 改成 5 手，看两个必须想清楚的边界：
+
+- `CancelOldest`：4 + 5 = 9 < 10 → **整体拒绝**，且 M2 **不得被撤**。预检是只读的——"先成交 M1、再撤 M2、最后发现不够"是不允许的，那会留下一个被无故撤销的 Maker。这就是"失败的 FOK 不修改订单簿"的含义。
+- **如果 M1 本身就有 10 手**，FOK 在接触 M2 之前已全额成交——两种策略下 M2 都不该被碰。STP 与预检都必须遵守**实际撮合顺序**，而不是"扫描范围内有自己人就插手"（`FokFillsBeforeContactingOwnBothPolicies` 钉住）。
+
+**POST-ONLY 为什么继续对账户失明？** 这不是遗漏，而是两个预检的"安全方向"不同：
+
+- POST-ONLY 的承诺是"绝不主动吃单"。**保守地多拒一笔永远不违反这个承诺**——拒单是安全方向，扯不上 STP；
+- FOK 的承诺是"全成或全不成"。**过度乐观地接受会直接违约**——部分成交是危险方向，必须在成交发生之前拦下。
+
+一句话记住：**预检的职责是保证"通过预检 ⇒ 执行必然履约"。** 履约承诺可能被 STP 打破的（FOK），预检必须懂 STP；承诺不可能被打破的（POST-ONLY），多一分保守都是安全的。
+
+**实现形态**：不需要为账户建索引。簿提供一次**只读的、按价格时间优先的遍历原语**（任务 3 会设计它；参考实现叫 `for_each_maker`），引擎在其中累计可达流动性、凑够即停。最坏复杂度 O(限价内挂单数)，只有 FOK 走这条路；还可以先用 `matchable_quantity`（含自己人的总量，是可达量的**上界**）做第一道快速排除——总量都不够直接拒绝，连逐笔扫描都省了。
+
+**预检与执行的等价性依赖什么？** 依赖"预检之后、执行之前，簿不再被改动"。W4 的单写者假设（单线程 + 回调不得重入改簿，§1.4）保证这一点——回调纪律在这里第二次发挥作用。将来进入多线程或允许重入回调时，这个不变量需要重新论证（W5 的题目之一）。
 
 ### 2.6 需求 B 的正式契约
 
@@ -369,8 +414,13 @@ W3 的两个预检（POST-ONLY 的交叉预判、FOK 的 `matchable_quantity`）
 - **CancelOldest**：撤销队头挂单（整单，发 `OrderCanceled{该单, quantity=其剩余量}`）；撮合继续，
   可连续撤销多笔；主动单不消耗量。
 - **策略切换**：`set_self_match_policy(policy)` 随时可调，只影响其后的 `submit`；默认 `CancelNewest`。
-- **预检保持账户盲**（§2.5）；**账户不参与校验**（除 0 外任何 int64 都是合法账户）。
+- **FOK 预检按可达流动性判定**（§2.5）：CN 下累计到第一笔自己的挂单为止、CO 下只数他人；
+  通过 ⇔ 必然全额成交；未通过 ⇒ `Rejected{FokNotFillable}` 且**零副作用**。
+  **FOK 永不部分成交、永不挂簿**——余量挂簿只属于 Limit/PostOnly。
+- **POST-ONLY 预检保持纯价格口径（账户盲）**；**账户不参与校验**（除 0 外任何 int64 都是合法账户）。
 - **余量挂簿携带账户**（`Order r = o;` 自然带上）：此后别人撞上这本余量，按它的账户判 STP。
+- **改价保留身份**：`OrderBook::modify(id, price, qty)` 重挂时必须原样保留该单的 `account` 与
+  `type`——若用 `Order{price, id, qty, side}` 重新构造，账户会退回 0，**这张单从此不再受 STP 保护**。
 
 对应到类型：
 
@@ -385,15 +435,15 @@ enum class SelfMatchPolicy : std::uint8_t {
 
 ## 3. 验收方式的变化：事件流为什么也要进差分
 
-W4 的验收为什么必须扩展而不是重复 W3 的 76 个用例？因为这次同时动了两样东西：
+W4 的验收为什么必须扩展而不是重复 W3 的 92 个用例？因为这次同时动了两样东西：
 
-1. **状态空间炸了**：账户（0/1/2）× 五种订单类型 × 两种策略 × 事件序列，手写用例只能枚举"想得到的"组合——"FOK 通过预检后被 STP 砍掉""IOC 连续撞三笔自己的挂单""策略在会话中途切换"这类交叉场景，靠手写是覆盖不完的。
+1. **状态空间炸了**：账户（0/1/2）× 五种订单类型 × 两种策略 × 事件序列，手写用例只能枚举"想得到的"组合——"FOK 的可达流动性在两种策略下的分歧""IOC 连续撞三笔自己的挂单""策略在会话中途切换"这类交叉场景，靠手写是覆盖不完的。
 2. **输出多了一条通道**：`SubmitResult` 是**汇总结果**（一个数量守恒的摘要），而**事件流是顺序敏感的完整契约**——第 k 个事件的每个字段、它的先后位置，都在契约里。下一段的教训说明了"顺序敏感 + 逐字节"的契约面为什么必须由差分来守。
 
 所以 W4 的差分机制这样升级：
 
-- **oracle 同步升级**：参考引擎（`naive_matching_engine_w4.h`）在慢速直白风格上增加账户、STP 两策略、事件记录；每一步产出三元组 **(SubmitResult, 事件流, 簿状态)**，与你的引擎逐项比对。
-- **40 个种子分工**：奇数种子跑 CancelNewest、偶数种子跑 CancelOldest，保证两种策略都被大量随机场景扫过；随机注入非法价/量（沿用 W3）。
+- **oracle 同步升级**：参考引擎（`naive_matching_engine_w4.h`）在慢速直白风格上增加账户、STP 两策略、事件记录；FOK 预检在挂单集合的**副本上干跑一次撮合**（纯读、零副作用），与引擎的"可达流动性扫描"是同一语义的两种写法；每一步产出三元组 **(SubmitResult, 事件流, 簿状态)**，与你的引擎逐项比对。
+- **40 个种子分工**：奇数种子跑 CancelNewest、偶数种子跑 CancelOldest，保证两种策略都被大量随机场景扫过；随机注入非法价/量（沿用 W3）。FOK × 账户 × 策略的随机组合会在这里被打穿——**预检与执行只要有一丝不一致，差分就会把它变成红色的 step**。
 - **失败信息自带现场**：`seed / step / policy / type / side / acct`，事件不一致时还给第几个事件与双方的 `kind`。
 
 **上一周的教训回放**：W3 差分测试曾经是你唯一抓住"`SubmitResult.reason` 未初始化"的那层验收——语义单测看不见"类型对外契约"。今天事件流把契约面扩大了一个量级（每条事件 8 个字段 × 顺序），差分的价值同步放大：**它不关心你的引擎"看起来对不对"，它把你引擎对外吐出的每一个字节都当作契约来核对。**
@@ -472,38 +522,65 @@ ctest --test-dir build    # 151 仍全绿；W4 测试现在红是预期的（引
 
 ---
 
-## 任务 3 ｜ STP 进撮合循环
+## 任务 3 ｜ 簿的只读遍历原语 + STP 进撮合循环 + FOK 可达流动性预检
 
 **① 目标（可验收）**
 
-`MatchingW4.Stp*` 一族的 10 个用例，加上同族的 4 个边界用例（`ZeroAccountNeverTriggersStp` / `DifferentAccountsTradeNormally` / `PolicySwitchMidStream` / `NegativeAccountIdStillTriggersStp`）共 14 个全绿；碰撞路径上的簿状态、事件、outcome 逐条符合 §2.6。
+1. `MatchingW4.Stp*`（9 个）+ 同族的 4 个边界用例（`ZeroAccountNeverTriggersStp` / `DifferentAccountsTradeNormally` / `PolicySwitchMidStream` / `NegativeAccountIdStillTriggersStp`）+ `MatchingW4.Fok*`（8 个）全绿；碰撞路径上的簿状态、事件、outcome 逐条符合 §2.6。
+2. `BookPrimitivesW4.ModifyKeepsAccountAndType` 全绿（改价保留账户与类型）。
+3. W1–W3 的 151 个测试保持全绿（改动最大的一个任务，每做一步就回归一次）。
 
-**② 为什么上面那些用例现在全红**
+**② 为什么这些用例现在全红**
 
-引擎还不知道"自己人"存在。而 §2.1–§2.4 已经把判定位置（接触点）、触发条件（非 0 同账户）、两种策略的行为、以及两条后果（余量不挂簿、循环终止）全部推导清楚——任务就是把它们落成代码。
+引擎做两件事的方式都要改：撮合循环还不知道"自己人"存在（§2.1–§2.4：接触点判定、触发条件、两种策略、余量不挂簿与循环终止）；FOK 的预检还在按"簿上有多少"判定（§2.5：必须按"当前策略下真正能吃到多少"判定，否则 FOK 的承诺会被 STP 打破）。
 
 **③ 提示**
 
-1. **单点插入**：循环内、`crosses` 通过之后、`consume_best` 之前。只判队头。
-2. **CancelNewest**：发 `OrderCanceled{主动单, 余量}` → 置 `self_killed = true` → `break`。关键联动：余量段的 `can_rest` 必须排除 `self_killed`，否则被砍的余量挂回簿上（§2.4 的交叉簿反例）。outcome 不需要新代码——既有规则自动落 `Cancelled`。
-3. **CancelOldest**：发 `OrderCanceled{队头单, 其剩余量}` → `book_.cancel(队头 id)` → `continue`。注意不消耗 `remaining`，且"同价下一笔可能又是自己的"（链式撤销由循环自然处理）。
-4. **不要动预检**。POST-ONLY 与 FOK 保持账户盲（§2.5）——如果你"顺手"让预检也看账户，`StpFokPrecheckBlindThenCancelledByNewest` 和 `StpPostOnlyPrecheckBlindToAccount` 会立刻红，而且那是**契约层面**的红，不是实现 bug。
-5. 推进顺序建议：先让 `StpCancelNewest*` 一族绿（最简单）→ `StpCancelOldest*` → `PolicySwitchMidStream` / `NegativeAccountId` 收尾。
+按三个小步走，每步都能单独验证：
+
+1. **簿的只读遍历原语**（`order_book.h` / `order_book.cpp`）：新增一个"按价格时间优先只读遍历限价内挂单"的公共方法。参考形态：
+
+   ```cpp
+   // visit 返回 false 立即停止遍历；方法自身不改簿、不分配。
+   void for_each_maker(Side side, std::optional<Price> limit,
+                       const std::function<bool(const Order &)> &visit) const;
+   ```
+
+   实现就是把 `matchable_quantity` 的双向 if/else 骨架换成"逐档、档内从 `head` 沿链表走"。**不要在簿里建账户索引**——一次只读遍历足够，而且不改任何数据结构。自测：先让 W3 的 `BookPrimitivesW3.*` 保持全绿（你没动旧原语），本方法暂时没有调用方也不影响构建。
+
+2. **FOK 预检替换**（`matching_engine.cpp`）：把原来的"`matchable_quantity < 需求量` 就拒"换成 §2.5 的两层判定——3a 用 `matchable_quantity` 做快速排除（总量不足直接拒）；3b 用 `for_each_maker` 按策略累计可达流动性（CN 撞上自己即停；CO 跳过自己继续累计；凑够即停），不足则 `reject(FokNotFillable)`。注意整个预检**只读**——失败路径不得留下任何簿变化（那会挂掉 `FokCancelOldestRejectsWhenReachInsufficient`）。
+   **如果 FOK 走的是"先进入撮合循环再说"的旧结构**，你会得到"部分成交的 FOK"——`MatchingW4.Fok*` 会集体红，`Cancelled + filled>0` 是它的特征症状。
+
+3. **STP 进撮合循环**：
+   - **单点插入**：循环内、`crosses` 通过之后、`consume_best` 之前。只判队头。
+   - **CancelNewest**：发 `OrderCanceled{主动单, 余量}` → 置 `self_killed = true` → `break`。关键联动：余量段的 `can_rest` 必须排除 `self_killed`，否则被砍的余量挂回簿上（§2.4 的交叉簿反例）。outcome 不需要新代码——既有规则自动落 `Cancelled`。通过 FOK 预检的单在 CN 下**永远不会**走到这里（可达流动性的定义保证吃到自己的挂单之前已经填满）。
+   - **CancelOldest**：发 `OrderCanceled{队头单, 其剩余量}` → `book_.cancel(队头 id)` → `continue`。注意不消耗 `remaining`，且"同价下一笔可能又是自己的"（链式撤销由循环自然处理）。通过 FOK 预检的单在 CO 下可能走到这里（撤退自己的 Maker 后继续填满）。
+   - **POST-ONLY 预检保持不动**（价格口径，§2.5 讲了两者"安全方向"的不同）。
+   - **改价保留身份**：检查你的 `OrderBook::modify(id, price, qty)`——若实现用 `Order{price, id, qty, side}` 重新构造节点，把 `account`/`type` 从旧订单上复制过来（或直接在原节点上改 price/quantity）。否则同一个单改价前后 STP 行为不同，`BookPrimitivesW4.ModifyKeepsAccountAndType` 会红。
+
+4. 推进顺序建议：先让 `StpCancelNewest*` 一族绿（最简单）→ `StpCancelOldest*` → `Fok*` 八连 → `PolicySwitchMidStream` / `NegativeAccountId` 收尾。
 
 **④ 验收**
 
 ```bash
-./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Stp*'
+cmake --build build -j
+./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Stp*:MatchingW4.Fok*:BookPrimitivesW4.*'
+ctest --test-dir build    # 151 个旧测试仍全绿
 ```
 
 **⑤ 常见错误**
 
 | 症状 | 病因 |
 |---|---|
+| FOK 出现 `Cancelled + filled>0` | 预检仍是"簿上有多少"口径（部分成交的 FOK = 违约），没换成可达流动性 |
+| CO 下 FOK 预检通过但执行时差量 | 预检把自己账户的挂单也计入了可达量（CO 只数他人量） |
+| 失败的 FOK 之后簿变了（自己的挂单被撤） | 预检动了簿——它必须是纯读；撤销只能发生在真实撮合里 |
+| 自己的挂单在限价之外仍被撤/仍阻止 FOK | 遍历没按交叉范围过滤（闭区间：买 `price >= limit` / 卖 `price <= limit`） |
+| `StpPostOnlyPrecheckBlindToAccount` 红 | 把 POST-ONLY 也改成了账户感知（它保持价格口径） |
+| `ModifyKeepsAccountAndType` 红 | 改价重新构造了 Order，account/type 丢失 |
 | CN 后 `resting` 不为 0 / 簿出现交叉 | 余量挂回簿了（`self_killed` 没接进 `can_rest`） |
 | CO 卡死或行为错 | 忘了 `continue`（或错误地消耗了 `remaining`） |
 | 负数账户不触发 | 用了 `> 0` 而不是 `!= 0` |
-| `StpFok*` / `StpPostOnly*` 红 | 把 STP 写进了预检（动了不该动的地方） |
 | CO 少发事件 | 撤挂单忘了发 `OrderCanceled` |
 
 **⑥ 答案**：附录 A3。
@@ -556,7 +633,7 @@ ctest --test-dir build    # 151 仍全绿；W4 测试现在红是预期的（引
 
 **② 为什么需要**
 
-`tests/` 里已经躺着 76 个 W4 用例，但 `add_executable` 的源列表不认识新文件——不改 CMake，你写再多也没人告诉你对没对。
+`tests/` 里已经躺着 84 个 W4 用例，但 `add_executable` 的源列表不认识新文件——不改 CMake，你写再多也没人告诉你对没对。
 
 **③ 提示**
 
@@ -573,11 +650,13 @@ cmake --build build -j
 4. 认一下过滤尺子：
 
 ```bash
-./build/tests/maelstrom_tests --gtest_filter='MatchingW4.*'             # 语义 + 生命周期（28）
+./build/tests/maelstrom_tests --gtest_filter='MatchingW4.*'             # 语义 + 生命周期（35）
 ./build/tests/maelstrom_tests --gtest_filter='EventBusW4.*'             # 总线（8）
-./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Stp*'          # STP 主力一族（10）
+./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Stp*'          # STP 主力一族（9）
+./build/tests/maelstrom_tests --gtest_filter='MatchingW4.Fok*'          # FOK × STP 可达流动性（8）
+./build/tests/maelstrom_tests --gtest_filter='BookPrimitivesW4.*'       # 簿原语：改价保留账户（1）
 ./build/tests/maelstrom_tests --gtest_filter='Seeds/MatchingDifferentialW4.RandomSubmitSequence/7'
-ctest --test-dir build --output-on-failure                              # 全量（含 W1-W3，共 227）
+ctest --test-dir build --output-on-failure                              # 全量（含 W1-W3，共 235）
 ```
 
 **④ 验收**：上述命令能列出/运行对应用例（语义用例此时红着——预期内的红，是起跑线）。
@@ -591,28 +670,31 @@ ctest --test-dir build --output-on-failure                              # 全量
 **① 目标**
 
 ```bash
-./build/tests/maelstrom_tests --gtest_filter='MatchingW4.*:EventBusW4.*'   # 28 + 8 = 36
-[  PASSED  ]  36 tests
+./build/tests/maelstrom_tests --gtest_filter='MatchingW4.*:EventBusW4.*:BookPrimitivesW4.*'   # 35 + 8 + 1 = 44
+[  PASSED  ]  44 tests
 ```
 
 并且下面每个问题你能对着代码讲出来（写进笔记）。
 
 **② 提示**
 
-1. 失败按族缩小范围：`Stp*` / `EventSequence*` / `Huge*` / `Lifetime*`；差分失败信息带 seed/step/policy/事件序号，抄下来可以二分定位。
+1. 失败按族缩小范围：`Stp*` / `Fok*` / `EventSequence*` / `Huge*` / `Lifetime*`；差分失败信息带 seed/step/policy/事件序号，抄下来可以二分定位。
 2. **口试自检**：
    - `account == 0` 为什么永不触发 STP？把这个豁免删掉，W3 的哪些测试会红、为什么？
    - CancelNewest 的余量为什么必须消失而不是挂簿？（提示：对着那个"交叉簿"反例讲。）
    - CancelOldest 的循环为什么一定终止？它会不会撤掉主动单自己？
    - CN / CO 在"成交序列、事件序列、outcome"三个维度上各有什么差别？
    - 为什么判定放在执行接触点，而不是下单前扫全簿？（给出 §2.1 的过度拦截反例。）
-   - FOK 通过了预检却被 STP 砍成 `Cancelled`——这是 bug 还是契约？把 STP 折进预检要付什么代价？
+   - FOK 的预检为什么必须懂策略（可达流动性），而 POST-ONLY 的预检可以继续对账户失明？两个预检的"安全方向"分别是什么？
+   - 失败的 FOK 为什么必须做到零副作用？如果一个实现"先成交一部分、再发现不够、最后回滚"，会在哪里出问题？
+   - 为什么"预检通过 ⇒ 执行必然履约"这个等价性依赖单写者假设（回调不得重入改簿）？
+   - 改价为什么必须保留 `account`？不保留会造成什么后果？（对着 `ModifyKeepsAccountAndType` 讲。）
    - 全额成交为什么没有终态事件？"事件 = 市场可观察事实"这个口径如果换成"事件 = 订单生命周期"，契约会怎么变？
    - `SubscriptionId` 为什么单调不复用？构造一个"复用会出事"的场景。
    - 事件为什么必须同步发完再返回（`submit` 返回后，"世界已知"是可以依赖的事实）？异步化会把什么复杂度带进来（预告 W5）？
    - 一笔 CancelOldest 的 IOC 连撞三笔同价自己的挂单，事件流长什么样？outcome 是什么？
 
-**③ 理想效果**：36 全绿，且上述问题能口头回答。
+**③ 理想效果**：44 全绿，且上述问题能口头回答。
 
 **④ 答案**：无（口试题的答案就是你对代码的理解）。
 
@@ -623,7 +705,7 @@ ctest --test-dir build --output-on-failure                              # 全量
 **① 目标**
 
 1. 差分对拍全绿（40 种子 × 400 步，两策略各半）；
-2. ASan + UBSan + LSan 下 227 个全绿；
+2. ASan + UBSan + LSan 下 235 个全绿；
 3. 提交。
 
 **② 为什么这周的门禁更重**
@@ -643,7 +725,7 @@ ctest --test-dir build --output-on-failure
 2. 再跑内存/UB 门禁（脚本会用 ASan+UBSan+LSan 重编库与全部测试，只读源码、只写 /tmp）：
 
 ```bash
-scripts/run_sanitizers.sh                    # 全部（227 个）
+scripts/run_sanitizers.sh                    # 全部（235 个）
 scripts/run_sanitizers.sh 'MatchingW4.*'     # 只跑 W4 语义 + 生命周期
 scripts/run_sanitizers.sh 'MatchingW4.Lifetime*'
 ```
@@ -655,6 +737,7 @@ scripts/run_sanitizers.sh 'MatchingW4.Lifetime*'
 | 事件数不一致 | 发布点漏发/多发（Market/IOC 取消；CN 与取消事件重复） |
 | 第 k 个事件不一致 | 字段填错（Rested 的 price/account）或顺序错（CO 撤销位置） |
 | SubmitResult 不一致 | CN 余量挂回簿（resting 错）或 outcome 手工特判错 |
+| FOK 出现 `Cancelled + filled>0` / 差异集中在 `type=Fok` 的 step | 预检按"簿上有多少"而非"可达多少"判定（§2.5）；或预检/执行对 STP 的判定不一致 |
 | size / best / find / quantity_at 不一致 | 簿状态维护错（余量没带账户、撤销没清干净） |
 | cancel 返回值不一致 | 撤单路径 |
 
@@ -669,12 +752,12 @@ git commit -m "W4: event bus + self-match prevention (cancel-newest/cancel-oldes
 
 ```
 # 普通 Debug 构建
-[==========] 227 tests from 9 test suites ran.
-[  PASSED  ] 227 tests.
+[==========] 235 tests from 10 test suites ran.
+[  PASSED  ] 235 tests.
 
 # 内存/UB 门禁（ASan+UBSan+LSan）
 scripts/run_sanitizers.sh
-[  PASSED  ] 227 tests.               ← 无 sanitizer 报告 = 内存干净、无 UB
+[  PASSED  ] 235 tests.               ← 无 sanitizer 报告 = 内存干净、无 UB
 ```
 
 **⑤ 答案**：无（这一步是验收与提交）。
@@ -696,6 +779,7 @@ scripts/run_sanitizers.sh
 | `Event` | `matching_engine.h` | 八字段，除 kind 外全有默认值 |
 | `SubscriptionId = uint64_t` | `matching_engine.h` | 从 1 递增、不复用 |
 | `EventBus` | `matching_engine.h` | subscribe/unsubscribe/publish/subscriber_count |
+| `OrderBook::for_each_maker` | `order_book.h` | 只读、按价格时间优先遍历限价内挂单（FOK 预检用） |
 
 **Event 字段语义**（`{0}` = 无意义，保持默认）
 
@@ -725,7 +809,19 @@ scripts/run_sanitizers.sh
 | outcome | `Cancelled`（既有规则自动落） | 由既有规则决定 |
 | 事件 | 1 个 OrderCanceled（主动单） | 每撤一笔 1 个 OrderCanceled |
 
-**不变的 W3 部分**：校验顺序与五种原因码；预检账户盲；成交价=被动价；outcome 判定规则；`set_trade_handler` 通道。
+**FOK 预检（可达流动性，§2.5）**
+
+| 策略 | 可达量 | 预检通过 ⇔ |
+|---|---|---|
+| CN | 价格时间优先累计他人量，**撞上第一笔自己的挂单即停止** | 执行时不会接触自己的挂单，必然全额成交 |
+| CO | 限价内全部他人量（跳过自己的继续累计） | 执行时撤退自己的 Maker 后必然全额成交 |
+
+未通过 ⇒ `Rejected{FokNotFillable}` + **零副作用**（一条 OrderRejected 事件之外什么都没有）。
+FOK 永不部分成交、永不挂簿。POST-ONLY 预检保持价格口径（账户盲）。
+
+**改价**：`modify(id, price, qty)` 重挂时保留 `account`/`type`，否则该单从此不受 STP 保护。
+
+**不变的 W3 部分**：校验顺序与五种原因码；POST-ONLY 预检账户盲；成交价=被动价；outcome 判定规则；`set_trade_handler` 通道。
 
 ---
 
@@ -733,9 +829,9 @@ scripts/run_sanitizers.sh
 
 **完成标准（逐条可检查）**
 
-- [ ] `ctest --test-dir build`：227/227 通过（151 旧 + 76 新）。
-- [ ] `scripts/run_sanitizers.sh`：227/227，无 sanitizer 报告。
-- [ ] 口试自检的 10 个问题能对着代码回答。
+- [ ] `ctest --test-dir build`：235/235 通过（151 旧 + 84 新）。
+- [ ] `scripts/run_sanitizers.sh`：235/235，无 sanitizer 报告。
+- [ ] 口试自检的 13 个问题能对着代码回答。
 - [ ] `git log` 上有一条 W4 提交。
 
 **复盘（用三句话写进笔记）**
@@ -878,9 +974,42 @@ private:
 
 需要 `#include <vector>`。
 
-### A3 — 任务 3/4：matching_engine.cpp 增量
+### A3 — 任务 3/4：簿的只读遍历原语 + matching_engine.cpp 增量
 
-以下是**增量（diff 视角）**，完整结构仍是你 W3 写的 `submit`。
+先加簿原语（`order_book.h` / `order_book.cpp`），再改引擎（`matching_engine.cpp`）。
+
+**簿原语**（声明与实现，均不改任何数据结构）：
+
+```cpp
+// order_book.h（类内，放在 matchable_quantity 之后）
+// 按价格时间优先顺序【只读】遍历 side 侧限价内的挂单；visit 返回 false 立即停止。
+void for_each_maker(Side side, std::optional<Price> limit,
+                    const std::function<bool(const Order &)> &visit) const;
+
+// order_book.cpp
+void OrderBook::for_each_maker(Side side, std::optional<Price> limit,
+                               const std::function<bool(const Order &)> &visit) const {
+    if (!impl_ || !visit) return;
+    if (side == Side::Buy) {                        // 买盘降序：最高买价优先
+        for (const auto &[price, level] : impl_->bids) {
+            if (limit.has_value() && price < limit->get()) break;
+            for (const OrderNode *n = level.head; n != nullptr; n = n->next) {
+                if (!visit(n->order)) return;
+            }
+        }
+    }
+    else {                                          // 卖盘升序：最低卖价优先
+        for (const auto &[price, level] : impl_->asks) {
+            if (limit.has_value() && price > limit->get()) break;
+            for (const OrderNode *n = level.head; n != nullptr; n = n->next) {
+                if (!visit(n->order)) return;
+            }
+        }
+    }
+}
+```
+
+**引擎增量**（`matching_engine.cpp`；以下是**增量视角**，完整结构仍是你 W3 写的 `submit`）：
 
 ```cpp
 // 1) 拒绝收口：五个校验分支全走这里（发布点 1/7）
@@ -899,7 +1028,30 @@ auto reject = [&](RejectReason r) {
 };
 if (o.quantity.get() <= 0) return reject(RejectReason::InvalidQuantity);
 if (book_.find(o.orderId).has_value()) return reject(RejectReason::DuplicateOrderId);
-// ... 价格校验与 POST-ONLY / FOK 预检同 W3（账户盲，§2.5），走 reject(...)
+// ... 价格校验与 POST-ONLY 预检同 W3（账户盲，§2.5），走 reject(...)
+
+// 3) FOK 预检：STP 感知的"可达流动性"判定（§2.5）——替换 W3 的 matchable_quantity 单查
+const std::optional<Price> limit = is_market ? std::nullopt : std::optional<Price>{o.price};
+if (o.type == OrderType::Fok) {
+    // 3a) 快速排除：限价内总量（含自己的）是可达量的上界，不足则必然不可成交
+    if (book_.matchable_quantity(opp, limit).get() < o.quantity.get()) {
+        return reject(RejectReason::FokNotFillable);
+    }
+    // 3b) 精查：按价格时间优先累计"当前策略下真正能吃到"的量（纯读，零副作用）
+    std::int64_t       reachable = 0;
+    const std::int64_t need      = o.quantity.get();
+    book_.for_each_maker(opp, limit, [&](const Order &maker) {
+        if (o.account.get() != 0 && maker.account == o.account) {
+            if (policy_ == SelfMatchPolicy::CancelNewest) {
+                return false;   // CN：撞上自己的挂单余量必被砍，可达流动性到此为止
+            }
+            return true;        // CO：自己的挂单会被撤掉，不提供成交也不阻塞
+        }
+        reachable += maker.quantity.get();
+        return reachable < need; // 凑够即停
+    });
+    if (reachable < need) return reject(RejectReason::FokNotFillable);
+}
 
 bool self_killed = false; // STP-CN：主动单余量被砍，禁止挂簿（§2.4）
 while (remaining > 0) {
@@ -973,6 +1125,7 @@ bool MatchingEngine::cancel(OrderId id) {                // 发布点 7/7
 - STP-CN 不需要新的 outcome 分支——W3 的规则（`resting == 0` 且 `filled < original` → `Cancelled`）自动覆盖它；你要做的只是用 `self_killed` 把余量挡在挂簿之外（§2.4）。
 - `else if (remaining > 0 && !self_killed)` 是 Market/IOC 的终态事件出口；`!self_killed` 防止与 CN 的取消事件重复。
 - 每轮循环要么撤一笔（簿缩小）、要么吃一笔（remaining 缩小）、要么 break——CO 的连撤必然终止（§2.4）。
+- FOK 预检的两条核心性质：**只读**（失败 ⇒ 零副作用，簿连一笔 Maker 都不能少）与**等价**（通过 ⇒ 撮合阶段必然填满——CN 下不会接触自己的挂单、CO 下撤退自己的 Maker 后他人量足够；这正是 §2.5 定义的可达流动性在起作用）。注意 `for_each_maker` 里的 `return false` 是"停止遍历"，不是"失败"——失败与否由累计出的 `reachable < need` 决定。
 
 ### A4 — 任务 5：CMake 改动
 
@@ -1003,12 +1156,14 @@ add_executable(maelstrom_tests
 
 - **做**：`AccountId` 与订单账户、自成交防护两策略（执行接触点判定）、
   `Event`/`EventBus`（多订阅、退订、注册顺序、同步分发）、引擎七处发布点、
-  W3 全量回归、事件流参与随机差分、内存/UB 门禁。
+  **FOK 的策略感知可达流动性预检**（含簿的只读遍历原语）、
+  **改价保留 `account`/`type`**、W3 全量回归、事件流参与随机差分、内存/UB 门禁。
 - **不做（留给后续）**：
   - 分发期间订阅/退订、多线程分发与并发安全 → W5（无锁队列 + 线程隔离）；
   - 更多 STP 策略（Decrement / RejectIncoming / CancelBoth）→ 扩展模块（迁移练习 1）；
   - `std::variant` 事件、事件持久化/回放、订阅优先级 → 扩展模块（迁移练习 3）；
   - 订单改价触发重撮合（提示：改价 = 撤单事件 + 新挂单事件？）；
+  - 可达流动性预检的性能优化（每笔 FOK 扫描可成交前缀；账户索引/缓存是扩展题）→ W7；
   - 低延迟分发（内联小函数、静态多播）→ W6/W7。
 
 > 一句话记住 W4 的定位：**W3 的引擎只对调用者负责；W4 的引擎对市场负责——
