@@ -10,7 +10,7 @@ FetchContent_Declare(
 set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 
-add_executable(maelstrom_tests test_order_book.cpp test_order_book_w2.cpp test_matching_engine_w3.cpp)
+add_executable(maelstrom_tests test_order_book.cpp test_order_book_w2.cpp test_matching_engine_w3.cpp test_matching_engine_w4.cpp)
 target_link_libraries(maelstrom_tests PRIVATE
     maelstrom::maelstrom
     GTest::gtest_main

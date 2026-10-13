@@ -114,4 +114,21 @@ SubmitResult MatchingEngine::submit(Order order) {
     }
     return submit;
 }
+
+void MatchingEngine::set_self_match_policy(SelfMatchPolicy policy){
+    policy_=policy;
+}
+
+bool MatchingEngine::unsubscribe(SubscriptionId id){
+    return bus_.unsubscribe(id);
+}
+
+void MatchingEngine::publish(const Event &event){
+    bus_.publish(event);
+}
+
+[[nodiscard]]SubscriptionId MatchingEngine::subscribe(EventBus::Handler handler){
+    return bus_.subscribe(handler);
+}
+
 }; // namespace matching_engine

@@ -34,8 +34,8 @@ enum class EventKind : std::int8_t {
 };
 
 enum class SelfMatchPolicy : std::int8_t {
-    CancelNewset,
-    CancelOldset,
+    CancelNewest, // 取消新单
+    CancelOldest, // 取消旧单
 };
 
 struct Trade {
@@ -57,11 +57,11 @@ struct SubmitResult {
 };
 
 struct Event {
-    EventKind    kind;
+    EventKind    kind{EventKind::Trade};
     OrderId      order_id{0};
     AccountId    account{0};
     Side         side{Side::Sell};
-    OrderId      couterparty_id{0}; // 对手方id
+    OrderId      counterparty_id{0}; // 对手方id
     Price        price{0};
     Quantity     quantity{0};
     RejectReason reason{RejectReason::None};
@@ -131,6 +131,6 @@ private:
     OrderBook       book_;
     TradeHandler    handler_;
     EventBus        bus_;
-    SelfMatchPolicy policy_{SelfMatchPolicy::CancelNewset};
+    SelfMatchPolicy policy_{SelfMatchPolicy::CancelNewest};
 };
 } // namespace matching_engine
